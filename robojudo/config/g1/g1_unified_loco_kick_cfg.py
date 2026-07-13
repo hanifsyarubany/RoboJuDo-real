@@ -28,7 +28,10 @@ Everything you'd flip between a sim2sim test and a real-robot deploy is a single
                 = "keyboard"
                 = "joystick"
   (On real hardware the robot's own controller (UnitreeCtrl) is always available; CONTROLLER just
-   adds keyboard on top if you have one connected.)
+   adds keyboard on top if you have one connected. If no DISPLAY is set -- e.g. a headless SSH
+   session onboard the robot -- keyboard is skipped automatically with a warning instead of
+   crashing (pynput's keyboard backend needs an X server); CONTROLLER="keyboard" explicitly in
+   that situation is a hard error instead, since there's no other controller to fall back to.)
 
   NET_IF        = network interface to the robot (only used when DEPLOY_TARGET="real").
 =================================================================================
@@ -42,9 +45,14 @@ CONTROLS
   Stop: keyboard Esc / joystick A (emergency stop on real).
 """
 
+import logging
+import os
+
 from robojudo.config import cfg_registry
 from robojudo.controller.ctrl_cfgs import JoystickCtrlCfg, KeyboardCtrlCfg, UnitreeCtrlCfg
 from robojudo.pipeline.pipeline_cfgs import RlMultiPolicyPipelineCfg, RlPipelineCfg
+
+logger = logging.getLogger(__name__)
 
 from .env.g1_holosoma_env_cfg import G1HolosomaMujocoEnvCfg, G1HolosomaRealEnvCfg
 from .policy.g1_amo_policy_cfg import G1AmoPolicyCfg
@@ -84,6 +92,24 @@ def _make_ctrl(policy_switch_triggers: dict | None = None):
     ctrls = []
     want_kb = CONTROLLER in ("both", "keyboard")
     want_js = CONTROLLER in ("both", "joystick")
+
+    # KeyboardCtrl imports pynput at module-import time, which on Linux needs an X server -- fails
+    # hard (crashes pipeline construction) when run headless, e.g. onboard the robot's own compute
+    # over SSH with no DISPLAY. CONTROLLER="both" is a sane default on a workstation with a screen
+    # but not onboard, so degrade gracefully there instead of making the switch a manual chore.
+    if want_kb and not os.environ.get("DISPLAY"):
+        if CONTROLLER == "keyboard":
+            raise RuntimeError(
+                "CONTROLLER='keyboard' but no DISPLAY is set -- pynput's keyboard backend needs an "
+                "X server, so this won't work over a headless SSH session (e.g. onboard the "
+                "robot). Set CONTROLLER='joystick' here, or run from a session with a display."
+            )
+        logger.warning(
+            "No DISPLAY set -- skipping the keyboard controller (pynput needs an X server); "
+            "keeping joystick/UnitreeCtrl only. This is expected when running headless onboard "
+            "the robot. Set CONTROLLER='joystick' explicitly to silence this."
+        )
+        want_kb = False
 
     if want_kb:
         ctrls.append(

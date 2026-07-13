@@ -257,3 +257,21 @@ magnitude) rather than applied instantly.
 - **Checkpoint feels wobbly/jittery on real hardware** — run a `--dry-run` first and check the
   warning log for saturating actions or torque-limit violations before assuming it's a tuning
   issue with the deploy stack itself.
+- **`ImportError: .../torch/lib/libgomp.so.1: cannot allocate memory in static TLS block`** —
+  glibc's static TLS surplus (a small, fixed-size-per-process area native-extension shared
+  libraries claim on load) got exhausted before torch's own bundled `libgomp.so.1` could claim its
+  block. `run_pipeline_prepared.py` imports `robojudo.pipeline` (and therefore torch) before
+  `mujoco` specifically to avoid this — if it still happens on your machine, try:
+  ```bash
+  LD_PRELOAD=$(gcc -print-file-name=libgomp.so.1) python scripts/run_pipeline_prepared.py -c g1_unified_loco_kick --dry-run
+  ```
+  or, on glibc ≥2.35:
+  ```bash
+  GLIBC_TUNABLES=glibc.rtld.optional_static_tls=2097152 python scripts/run_pipeline_prepared.py -c g1_unified_loco_kick --dry-run
+  ```
+- **`pynput` / X server error onboard the robot** (`this platform is not supported: failed to
+  acquire X connection`) — the robot's onboard computer is headless (no `DISPLAY`), and `pynput`'s
+  keyboard backend needs an X server. `CONTROLLER = "both"` now detects this automatically and
+  skips keyboard with a warning instead of crashing — the robot's own wireless remote (`UnitreeCtrl`)
+  still works normally. If you still hit this, you're likely on an older checkout; set
+  `CONTROLLER = "joystick"` explicitly in the config as a manual workaround.
