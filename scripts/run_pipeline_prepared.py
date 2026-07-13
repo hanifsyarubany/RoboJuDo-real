@@ -77,11 +77,24 @@ class DryRunSafetyMonitor:
         self._prev_raw_action = None
 
         self._joint_names = list(self.env.dof_cfg.joint_names)
-        self._joint_ranges = []
-        for name in self._joint_names:
-            jid = mujoco.mj_name2id(self.env.model, mujoco.mjtObj.mjOBJ_JOINT, name)
-            limited = jid >= 0 and bool(self.env.model.jnt_limited[jid])
-            self._joint_ranges.append(tuple(self.env.model.jnt_range[jid]) if limited else None)
+        self._joint_ranges = [None] * len(self._joint_names)
+        # env.model (raw MuJoCo model) only exists on MujocoEnv (sim) -- UnitreeCppEnv (real) has
+        # no such attribute, since it wraps the real robot's SDK directly. Both env configs load a
+        # MuJoCo model for forward-kinematics purposes regardless (same XML), exposed uniformly as
+        # env.kinematics.model on the base Environment class -- use that instead so joint-range
+        # checks work on both sim and real. Falls back to skipping the range check (still get
+        # torque/NaN/saturation/rate checks) if kinematics wasn't configured for some other env.
+        kin_model = getattr(getattr(self.env, "kinematics", None), "model", None)
+        if kin_model is not None:
+            for i, name in enumerate(self._joint_names):
+                jid = mujoco.mj_name2id(kin_model, mujoco.mjtObj.mjOBJ_JOINT, name)
+                limited = jid >= 0 and bool(kin_model.jnt_limited[jid])
+                self._joint_ranges[i] = tuple(kin_model.jnt_range[jid]) if limited else None
+        else:
+            logger.warning(
+                "DryRunSafetyMonitor: env has no forward-kinematics model available -- skipping "
+                "joint-range checks (NaN/saturation/torque-limit/action-rate checks still run)."
+            )
 
         # get_pd_target's return value is never surfaced by pipeline.step(), so capture it here.
         orig_get_pd_target = pipeline.policy.get_pd_target
