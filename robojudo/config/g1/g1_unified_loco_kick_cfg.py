@@ -67,6 +67,24 @@ NET_IF = "eth0"  # robot network interface (only for DEPLOY_TARGET="real")
 _KB_KICK_TRIGGERS = {"k": "[TRIGGER_KICK]", "l": "[RETURN_TO_LOCO]"}
 _JS_KICK_TRIGGERS = {"RB+Up": "[TRIGGER_KICK]", "RB+Down": "[RETURN_TO_LOCO]"}
 
+# The real Unitree remote (UnitreeCtrl, via unitreeRemoteController.button_map) names its shoulder
+# buttons "L1"/"R1"; a generic gamepad (JoystickCtrl, via JoystickThread's Xbox-style button_map)
+# names the same physical buttons "LB"/"RB". UnitreeCtrlCfg.combination_init_buttons=["L1","R1"]
+# means a real "RB held + D-pad Up" press computes the combo key "R1+Up", not "RB+Up" -- so trigger
+# dicts written with "RB"/"LB" (matching the docs/guide, which describe the generic-gamepad layout)
+# silently never fire on real hardware unless remapped. Keep triggers written in "RB"/"LB" terms
+# everywhere and remap only when building the real controller.
+_UNITREE_BUTTON_ALIASES = {"LB": "L1", "RB": "R1"}
+
+
+def _remap_combo_keys(triggers: dict[str, str], aliases: dict[str, str]) -> dict[str, str]:
+    """Rewrite 'RB+Up'-style trigger keys' button names via aliases (e.g. RB -> R1)."""
+    remapped = {}
+    for key, cmd in triggers.items():
+        parts = [aliases.get(p, p) for p in key.split("+")]
+        remapped["+".join(parts)] = cmd
+    return remapped
+
 
 def _make_env():
     """sim2sim vs real onboard, from the single DEPLOY_TARGET switch.
@@ -119,8 +137,10 @@ def _make_ctrl(policy_switch_triggers: dict | None = None):
             )
         )
     if DEPLOY_TARGET == "real":
-        # the robot's own controller is always available on hardware (emergency stop = A)
-        ctrls.append(UnitreeCtrlCfg(triggers_extra={**_JS_KICK_TRIGGERS, **js_extra}))
+        # the robot's own controller is always available on hardware (emergency stop = A). Remap
+        # RB/LB -> R1/L1 (see _UNITREE_BUTTON_ALIASES) so combo triggers actually fire.
+        real_triggers = _remap_combo_keys({**_JS_KICK_TRIGGERS, **js_extra}, _UNITREE_BUTTON_ALIASES)
+        ctrls.append(UnitreeCtrlCfg(triggers_extra=real_triggers))
     elif want_js:
         ctrls.append(JoystickCtrlCfg(triggers_extra={**_JS_KICK_TRIGGERS, **js_extra}))
 
