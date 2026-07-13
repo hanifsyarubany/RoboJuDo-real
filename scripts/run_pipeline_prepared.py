@@ -9,13 +9,20 @@ import argparse
 import logging
 import time
 
-import mujoco
 import numpy as np
 
+# import robojudo.pipeline (and therefore torch, via robojudo/__init__.py) BEFORE mujoco. On some
+# platforms (seen on the G1 onboard computer) importing mujoco first exhausts glibc's static TLS
+# surplus -- a small, fixed-size-per-process area that native-extension shared libraries claim on
+# load -- leaving no room for torch's own bundled libgomp.so.1 to claim its block, which fails with
+# "cannot allocate memory in static TLS block". The stock run_pipeline.py never imports mujoco at
+# module scope at all, so it never hit this; keep torch loading first here too.
 import robojudo.pipeline
 from robojudo.config.config_manager import ConfigManager
 from robojudo.pipeline.pipeline_cfgs import RlPipelineCfg
 from robojudo.pipeline.rl_pipeline import RlPipeline
+
+import mujoco  # noqa: E402 -- see note above; must come after robojudo.pipeline
 
 logger = logging.getLogger("robojudo")
 
