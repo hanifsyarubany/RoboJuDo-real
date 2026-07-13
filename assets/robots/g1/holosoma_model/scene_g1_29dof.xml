@@ -1,0 +1,50 @@
+<!-- RoboJuDo sim2sim scene for the holosoma-trained G1 model.
+
+Wraps holosoma's pristine robot model (g1_29dof.xml, copied verbatim from
+locomotion_and_motion_tracking/holosoma/.../data/robots/g1/g1_29dof.xml) and adds only the ground
+plane + lighting that a standalone MuJoCo scene needs. The robot's calibrated dynamics -- per-joint
+armature, joint properties, and the foot<->floor contact pairs (solref=0.01, friction=0.8) -- all
+come from the included file unchanged, so this scene matches the model the policy was trained
+against. The floor geom is named "floor" to satisfy those contact pairs.
+
+Used by RoboJuDo's G1UnifiedLocoKickMujocoEnvCfg (see g1_holosoma_env_cfg.py). Physics timestep is
+set at runtime by MujocoEnv (sim_dt), not here. -->
+<mujoco model="g1_29dof_holosoma_scene">
+  <include file="g1_29dof.xml"/>
+
+  <statistic center="1.0 0.7 1.0" extent="0.8"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.1 0.1 0.1" specular="0.9 0.9 0.9"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="-140" elevation="-20"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="flat" rgb1="0 0 0" rgb2="0 0 0" width="512" height="3072"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4"
+             rgb2="0.1 0.2 0.3" markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
+  </asset>
+
+  <worldbody>
+    <light pos="1 0 3.5" dir="0 0 -1" directional="true"/>
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
+  </worldbody>
+
+  <!-- Holosoma's trained default standing pose, grounded (base z chosen so the lowest foot
+  collision capsule just touches z=0 -- computed by forward-kinematics, not guessed; see
+  scripts/run_pipeline_prepared.py, which resets to this keyframe before the control loop starts
+  in sim). Without this, MjData() initializes every joint to q=0 (straight legs) since the
+  included robot XML has no keyframe of its own -- corrupting every dof_pos-relative observation
+  from tick zero. Values = base pos/quat(wxyz) + the 29 joint angles in kinematic-tree order. -->
+  <keyframe>
+    <key name="default_stand"
+         qpos="0 0 0.756464 1 0 0 0
+               -0.312 0 0 0.669 -0.363 0
+               -0.312 0 0 0.669 -0.363 0
+               0 0 0
+               0.2 0.2 0 0.6 0 0 0
+               0.2 -0.2 0 0.6 0 0 0"/>
+  </keyframe>
+</mujoco>
