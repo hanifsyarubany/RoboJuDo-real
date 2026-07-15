@@ -471,11 +471,25 @@ class UnifiedLocoKickPolicyCfg(PolicyCfg):
         [0.8, 0.0, -0.8],  # yaw           (RightX / q,e)
     ]
 
-    # Seconds for the applied command to ramp from 0 to each axis's max magnitude (and symmetrically
-    # to decelerate back to 0), rather than stepping there in a single tick. A raw instant step is
+    # Seconds for the applied command to ramp from 0 to each axis's max magnitude when
+    # ACCELERATING, rather than stepping there in a single tick. A raw instant step is
     # in-distribution enough to not destabilize the policy on its own, but side-by-side sim testing
     # against holosoma's own reference (whose keyboard scheme is a gradual +/-0.1-per-press
     # accumulator, never an instant jump) showed the gradual-ramp case tracking the smoothest and
     # closest to holosoma's trajectory of any command profile tried -- this reproduces that smoothing
     # for both keyboard and joystick without needing to replicate holosoma's specific accumulator UX.
     command_ramp_time: float = 0.5
+
+    # DECELERATION is deliberately SLOWER than acceleration. Empirical result (v6 Stage-B
+    # checkpoint, MuJoCo, keyboard stop-from-max-speed 0.8 m/s, 10 release phases spanning a full
+    # gait cycle): instant cut fell at 8/10 phases, fast decel (0.15s) 8/10, the original
+    # symmetric 0.5s 3/10, and 1.0s decel 0/10. Stopping from a fast walk is the hard transient
+    # -- a longer decel keeps the robot passing through slower, fully in-distribution walking
+    # speeds and enters standing from a much easier state. (An earlier version of this comment
+    # argued the opposite -- that slow decel's "crawl regime" was out-of-distribution and fast
+    # decel matched training's discrete command resampling. The phase-swept control experiment
+    # disproved that: the crawl isn't the problem, the stop-from-speed is.) The snap band exists
+    # only to cleanly cross the policy's zero_cmd_eps standing threshold at the end of the ramp;
+    # keep it small so it doesn't recreate a discrete stop.
+    command_decel_time: float = 1.0
+    command_zero_snap: float = 0.02

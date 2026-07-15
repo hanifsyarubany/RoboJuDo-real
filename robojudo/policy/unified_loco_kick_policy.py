@@ -101,10 +101,21 @@ class UnifiedLocoKickPolicy(Policy):
         # ---- command remap (controller -> velocity, within training's [-1,1] range) ----
         self.commands_map = [np.asarray(m, dtype=np.float64) for m in cfg_policy.commands_map]
 
-        # ---- command rate limit (smooth onset/offset instead of an instant per-tick step) ----
-        ramp_time = max(cfg_policy.command_ramp_time, 1e-6)
+        # ---- command rate limit: ASYMMETRIC (accel ramped, decel even GENTLER + tiny snap) ----
+        # Acceleration is ramped (command_ramp_time) to avoid the jerky full-magnitude step a key
+        # press would otherwise command. Deceleration is slower still (command_decel_time):
+        # stopping from a fast walk is the hard transient for the policy, and a longer decel
+        # walks it down through slower, fully in-distribution speeds before entering standing.
+        # Phase-swept stop-from-0.8 falls (v6 Stage-B checkpoint, MuJoCo): instant cut 8/10,
+        # 0.15s decel 8/10, 0.5s 3/10, 1.0s 0/10 -- see policy_cfgs.py's field comment for the
+        # full experiment (including the disproven fast-decel hypothesis). The tiny snap band
+        # just ensures the tail of the ramp cleanly crosses zero_cmd_eps into standing.
         axis_max_mag = np.array([np.abs(m).max() for m in self.commands_map])
-        self._cmd_rate_limit_per_tick = (axis_max_mag / ramp_time) / self.freq  # [lin_x, lin_y, ang_z]
+        ramp_time = max(cfg_policy.command_ramp_time, 1e-6)
+        decel_time = max(cfg_policy.command_decel_time, 1e-6)
+        self._cmd_rate_limit_per_tick = (axis_max_mag / ramp_time) / self.freq  # accel, [lin_x, lin_y, ang_z]
+        self._cmd_decel_limit_per_tick = (axis_max_mag / decel_time) / self.freq
+        self._cmd_zero_snap = cfg_policy.command_zero_snap
 
         self.reset()
 
@@ -199,8 +210,16 @@ class UnifiedLocoKickPolicy(Policy):
                 cmd[2] = command_remap(raw_yaw, self.commands_map[2])
                 break
 
-        delta = np.clip(cmd - self._smoothed_cmd, -self._cmd_rate_limit_per_tick, self._cmd_rate_limit_per_tick)
+        # Per-axis asymmetric rate limit: accelerating (|target| growing) uses the slow ramp,
+        # decelerating uses the fast decel limit, and once the target is zero and the smoothed
+        # value is inside the snap band, it snaps straight to zero -- see __init__'s comment for
+        # why the slow-glide-to-zero was empirically destabilizing.
+        accelerating = np.abs(cmd) > np.abs(self._smoothed_cmd)
+        limit = np.where(accelerating, self._cmd_rate_limit_per_tick, self._cmd_decel_limit_per_tick)
+        delta = np.clip(cmd - self._smoothed_cmd, -limit, limit)
         self._smoothed_cmd = self._smoothed_cmd + delta
+        snap = (cmd == 0.0) & (np.abs(self._smoothed_cmd) < self._cmd_zero_snap)
+        self._smoothed_cmd = np.where(snap, 0.0, self._smoothed_cmd)
         self.lin_vel_command = self._smoothed_cmd[:2].copy()
         self.ang_vel_command = float(self._smoothed_cmd[2])
 

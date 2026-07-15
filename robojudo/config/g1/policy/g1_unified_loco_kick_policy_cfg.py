@@ -21,14 +21,20 @@ from robojudo.tools.tool_cfgs import DoFConfig
 #     "/workspaces/isaaclab_arena/submodules/workspaces/playground/locomotion_and_ball_kicking/logs/"
 #     "LocomotionAndBallKicking/20260712_083233-unified-stageB-ballobs-gated-locomotion/model_0119000.onnx"
 # )
-DEFAULT_ONNX_PATH = (
-    "assets/motions/g1/football_play/"
-    "20260712_083233-unified-stageB-ballobs-gated-locomotion/model_0119000.onnx"
-)
+# DEFAULT_ONNX_PATH = (
+#     "assets/motions/g1/football_play/"
+#     "20260712_083233-unified-stageB-ballobs-gated-locomotion/model_0119000.onnx"
+# )
 # DEFAULT_ONNX_PATH = (
 #     "assets/motions/g1/football_play/"
 #     "20260711_032532-unified-stageA-locomotion-locomotion/model_0015000.onnx"
 # )
+
+DEFAULT_ONNX_PATH = (
+    "assets/motions/g1/football_play/"
+    "20260714_150605-unified-stageB-ballobs-gated-v10-locomotion/model_0145000.onnx"
+)
+
 
 class G1UnifiedLocoKickDoF(DoFConfig):
     # 29-DoF G1, exactly the ONNX dof_names order (== RoboJuDo G1 env order). Placeholder only:
