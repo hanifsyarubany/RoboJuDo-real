@@ -80,7 +80,7 @@ KICK_TARGET_POS_B: WORLD-FRAME OFFSET vs. AZIMUTH COMMAND (read this before depl
   --target-x/--target-y are ignored entirely in this mode -- there is no world-frame target point
   to compute a relative offset from (kick_aim_theta is a bearing OFFSET, not a point).
 
-TRANSPORT: --transport {redis, ros2}
+TRANSPORT: --transport {redis, ros2, udp}
   'redis' (default, unchanged): SET the ball/aim reading as one JSON blob to --redis-key, matching
   BallPoseRedisCtrl.
 
@@ -91,7 +91,14 @@ TRANSPORT: --transport {redis, ros2}
   and its QoS default (BEST_EFFORT/VOLATILE, depth 5). Requires rclpy (ROS2) to be importable;
   imported lazily so plain --transport redis runs never need it installed.
 
-  Either transport, --robot-redis-key is STILL READ OVER REDIS: it is a sim-only convenience (see
+  'udp': send the same JSON blob as 'redis', but as a UDP datagram to --udp-dest-host/
+  --udp-dest-port instead of a Redis SET, matching BallPoseUdpCtrl. Exists to let you validate the
+  UDP path (the one used for real deployment where Redis is unavailable -- see
+  docs/real_ball_perception_interface.md) in sim first, the same way 'ros2' does, before trusting
+  it on hardware. This is a SIM-TESTING stand-in for scripts/foxy_ros2_ball_bridge.py, which is
+  what actually feeds BallPoseUdpCtrl on real hardware from inside the robot's native Foxy.
+
+  Any transport, --robot-redis-key is STILL READ OVER REDIS: it is a sim-only convenience (see
   this module's own WHAT THIS SIMULATES section) with no real-hardware equivalent, so it never
   needs to match whatever --transport the ball/aim channel itself uses.
 """
@@ -135,14 +142,14 @@ def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument(
         "--transport",
-        choices=["redis", "ros2"],
+        choices=["redis", "ros2", "udp"],
         default="redis",
         help="How to publish kick_ball_pos_b/kick_target_pos_b -- must match "
         "run_pipeline_prepared.py's --ball-source on the other side. See this module's TRANSPORT "
         "docstring section. The robot/true-ball sim-state relay below is unaffected -- always Redis.",
     )
-    ap.add_argument("--redis-host", default="localhost", help="Used for BOTH transports: also serves the "
-        "sim-only robot/true-ball relay (--robot-redis-key) regardless of --transport.")
+    ap.add_argument("--redis-host", default="localhost", help="Used regardless of --transport: also "
+        "serves the sim-only robot/true-ball relay (--robot-redis-key), which is always Redis.")
     ap.add_argument("--redis-port", type=int, default=6379)
     ap.add_argument("--redis-db", type=int, default=0)
     ap.add_argument(
@@ -152,7 +159,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--robot-redis-key",
         default="robot_pose_g1",
-        help="Used with EITHER --transport (this relay is always Redis -- see the TRANSPORT "
+        help="Used regardless of --transport (this relay is always Redis -- see the TRANSPORT "
         "docstring section). Must match run_pipeline_prepared.py's --robot-redis-key. Robot (and "
         "true ball) pose read from here.",
     )
@@ -172,6 +179,14 @@ def parse_args() -> argparse.Namespace:
         "--ros2-domain-id", type=int, default=None,
         help="Only used with --transport ros2. Overrides ROS_DOMAIN_ID for this process; default "
         "(unset) inherits the environment variable, same as any other ROS2 node.",
+    )
+    ap.add_argument(
+        "--udp-dest-host", default="localhost",
+        help="Only used with --transport udp. Host running run_pipeline_prepared.py --ball-source udp.",
+    )
+    ap.add_argument(
+        "--udp-dest-port", type=int, default=7790,
+        help="Only used with --transport udp. Must match BallPoseUdpCtrlCfg.listen_port.",
     )
     ap.add_argument("--rate", type=float, default=30.0, help="Publish rate, Hz.")
     ap.add_argument("--ball-x", type=float, default=DEFAULT_BALL_XYZ[0], help="Fallback ball world x (m) if no true ball.")
@@ -336,6 +351,31 @@ class _Ros2BallPublisher:
             self._rclpy.shutdown()
 
 
+class _UdpBallPublisher:
+    """--transport udp counterpart of the plain `client.set(args.redis_key, payload)` call in the
+    --transport redis path -- same JSON payload, sent as a UDP datagram instead of a Redis SET.
+    Stdlib-only (`socket`), matching BallPoseUdpCtrl's own dependency-free design."""
+
+    def __init__(self, dest_host: str, dest_port: int):
+        import socket
+
+        self._dest = (dest_host, dest_port)
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    def publish(self, ball_pos_b: np.ndarray, target_pos_b: np.ndarray, t: float) -> None:
+        payload = json.dumps(
+            {
+                "kick_ball_pos_b": ball_pos_b.tolist(),
+                "kick_target_pos_b": target_pos_b.tolist(),
+                "t": t,
+            }
+        )
+        self._sock.sendto(payload.encode("utf-8"), self._dest)
+
+    def shutdown(self) -> None:
+        self._sock.close()
+
+
 def main() -> int:
     args = parse_args()
 
@@ -351,6 +391,7 @@ def main() -> int:
     client = connect_redis(args.redis_host, args.redis_port, args.redis_db)
 
     ros2_pub = None
+    udp_pub = None
     if args.transport == "ros2":
         ros2_pub = _Ros2BallPublisher(
             node_name=args.ros2_node_name,
@@ -361,6 +402,12 @@ def main() -> int:
         logger.info(
             f"[transport=ros2] Publishing ball_pos_b -> '{args.ball_topic}' (PointStamped), "
             f"target_pos_b -> '{args.aim_topic}' (Vector3Stamped) at {args.rate:.0f} Hz."
+        )
+    elif args.transport == "udp":
+        udp_pub = _UdpBallPublisher(dest_host=args.udp_dest_host, dest_port=args.udp_dest_port)
+        logger.info(
+            f"[transport=udp] Sending ball/aim datagrams -> {args.udp_dest_host}:{args.udp_dest_port} "
+            f"at {args.rate:.0f} Hz."
         )
 
     arrows = _ArrowKeyOffset()
@@ -470,6 +517,8 @@ def main() -> int:
 
             if args.transport == "ros2":
                 ros2_pub.publish(ball_pos_b, target_pos_b)
+            elif args.transport == "udp":
+                udp_pub.publish(ball_pos_b, target_pos_b, t_start)
             else:
                 payload = json.dumps(
                     {
@@ -496,6 +545,8 @@ def main() -> int:
     finally:
         if ros2_pub is not None:
             ros2_pub.shutdown()
+        if udp_pub is not None:
+            udp_pub.shutdown()
     return 0
 
 

@@ -23,7 +23,7 @@ from redis.exceptions import RedisError
 import robojudo.pipeline
 from robojudo.config.config_manager import ConfigManager
 from robojudo.config.g1.env.g1_holosoma_env_cfg import HOLOSOMA_SCENE_WITH_BALL
-from robojudo.controller.ctrl_cfgs import BallPoseRedisCtrlCfg, BallPoseRos2CtrlCfg
+from robojudo.controller.ctrl_cfgs import BallPoseRedisCtrlCfg, BallPoseRos2CtrlCfg, BallPoseUdpCtrlCfg
 from robojudo.pipeline.pipeline_cfgs import RlPipelineCfg
 from robojudo.pipeline.rl_pipeline import RlPipeline
 
@@ -79,14 +79,21 @@ def parse_args():
     parser.add_argument(
         "--ball-source",
         type=str,
-        choices=["redis", "ros2"],
+        choices=["redis", "ros2", "udp"],
         default="redis",
         help=(
             "Only used with --live-ball. Transport for kick_ball_pos_b/kick_target_pos_b: "
             "'redis' (default, unchanged) adds a BallPoseRedisCtrl -- see --redis-host/--ball-redis-key. "
             "'ros2' adds a BallPoseRos2Ctrl subscribing to two topics instead (a live ball-position "
-            "topic plus a held aim-command topic) -- see --ball-topic/--aim-topic/--ros2-*. Point "
-            "scripts/dummy_ball_perception.py at the same transport with its own --transport flag."
+            "topic plus a held aim-command topic) -- see --ball-topic/--aim-topic/--ros2-*. "
+            "'udp' adds a BallPoseUdpCtrl listening on a plain UDP socket -- stdlib-only on both "
+            "ends, no Redis and no direct cross-distro ROS2 needed; use this for real-hardware "
+            "deployment where Redis cannot be installed/run at all (confirmed on a real G1) -- see "
+            "--udp-listen-host/--udp-listen-port and scripts/foxy_ros2_ball_bridge.py, which relays "
+            "real ROS2 topics into this same UDP channel from inside the robot's native Foxy. Point "
+            "scripts/dummy_ball_perception.py at the same transport with its own --transport flag "
+            "(redis/ros2 sim testing only -- udp has no dummy-perception counterpart, since it's "
+            "meant to be fed by foxy_ros2_ball_bridge.py or a real detector, not simulated)."
         ),
     )
     parser.add_argument(
@@ -141,6 +148,20 @@ def parse_args():
         default=None,
         help="Only used with --live-ball --ball-source ros2. Overrides ROS_DOMAIN_ID for this "
         "process; default (unset) inherits the environment variable, same as any other ROS2 node.",
+    )
+    parser.add_argument(
+        "--udp-listen-host",
+        type=str,
+        default=BallPoseUdpCtrlCfg().listen_host,
+        help="Only used with --live-ball --ball-source udp. Interface this process listens on "
+        "for ball/aim datagrams (0.0.0.0 = all interfaces).",
+    )
+    parser.add_argument(
+        "--udp-listen-port",
+        type=int,
+        default=BallPoseUdpCtrlCfg().listen_port,
+        help="Only used with --live-ball --ball-source udp. Must match the sender's "
+        "--udp-dest-port (foxy_ros2_ball_bridge.py or dummy_ball_perception.py --transport udp).",
     )
     args = parser.parse_args()
     return args
@@ -357,7 +378,7 @@ def main():
                 f"python scripts/dummy_ball_perception.py --transport redis --redis-host {args.redis_host} "
                 f"--redis-key {args.ball_redis_key} --robot-redis-key {args.robot_redis_key}"
             )
-        else:  # "ros2" -- see BallPoseRos2Ctrl's module docstring for the two-topic rationale
+        elif args.ball_source == "ros2":  # see BallPoseRos2Ctrl's module docstring for the two-topic rationale
             cfg.ctrl.append(
                 BallPoseRos2CtrlCfg(
                     node_name=args.ros2_node_name,
@@ -370,6 +391,18 @@ def main():
             perception_cmd = (
                 f"python scripts/dummy_ball_perception.py --transport ros2 --ball-topic {args.ball_topic} "
                 f"--aim-topic {args.aim_topic} --robot-redis-key {args.robot_redis_key}"
+            )
+        else:  # "udp" -- see BallPoseUdpCtrl's module docstring for why this exists (real hardware
+            # where Redis isn't usable and direct cross-distro ROS2 is unverified)
+            cfg.ctrl.append(
+                BallPoseUdpCtrlCfg(listen_host=args.udp_listen_host, listen_port=args.udp_listen_port)
+            )
+            ball_source_desc = f"UDP on {args.udp_listen_host}:{args.udp_listen_port}"
+            perception_cmd = (
+                f"python scripts/foxy_ros2_ball_bridge.py --dest-host <this-host> "
+                f"--dest-port {args.udp_listen_port}   (real hardware, run under native Foxy) -- or "
+                f"python scripts/dummy_ball_perception.py --transport udp --udp-dest-port "
+                f"{args.udp_listen_port}   (sim testing)"
             )
 
         if cfg.env.is_sim:
@@ -395,7 +428,8 @@ def main():
                 f"real hardware (dynamics are the physical robot, and a real camera-based detector "
                 f"already reports relative to itself without needing this) -- reading "
                 f"kick_ball_pos_b/kick_target_pos_b live from {ball_source_desc}. Point your real "
-                f"perception process at the same channel/shape (see scripts/dummy_ball_perception.py)."
+                f"perception process at the same channel/shape (see scripts/dummy_ball_perception.py, "
+                f"or for --ball-source udp, scripts/foxy_ros2_ball_bridge.py)."
             )
 
     pipeline_type = cfg.pipeline_type

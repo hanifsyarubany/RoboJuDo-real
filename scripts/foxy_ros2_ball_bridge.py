@@ -1,28 +1,35 @@
-"""Foxy-side ROS2 -> Redis bridge for live ball perception on the real G1.
+"""Foxy-side ROS2 -> UDP bridge for live ball perception on the real G1.
 
 RUN THIS UNDER THE ROBOT'S OWN NATIVE ROS2 FOXY PYTHON (e.g. after `source /opt/ros/foxy/
-setup.bash`), NOT under `conda activate robojudo` -- this script deliberately does not import
-anything from the robojudo package (no torch, no robojudo.pipeline) so it stays installable with
-just `pip install redis` on top of whatever Foxy already gives you. It is NOT run on the same
-Python/Distro as robojudo itself.
+setup.bash`), NOT under `conda activate robojudo` -- this script deliberately imports nothing from
+the robojudo package (no torch, no robojudo.pipeline) and needs NOTHING beyond the Python stdlib on
+top of whatever Foxy already gives you (`socket`, `json` -- no pip install of anything at all). It
+is NOT run on the same Python/Distro as robojudo itself.
 
-WHY THIS EXISTS, INSTEAD OF ROBOJUDO'S BallPoseRos2Ctrl TALKING TO FOXY DIRECTLY
+WHY UDP, NOT REDIS
+The original version of this bridge relayed to robojudo over Redis. That was tried on a real G1 and
+confirmed impossible to get running there. Rather than chase a different specific technology that
+might hit the same wall for the same unknown reason, this version removes every third-party
+dependency from the Humble/Foxy boundary entirely: a UDP datagram needs no server process, no
+daemon, nothing installed on either end beyond the two application processes (this bridge, and
+robojudo's BallPoseUdpCtrl) that were going to run anyway.
+
+WHY A BRIDGE AT ALL, INSTEAD OF ROBOJUDO'S BallPoseRos2Ctrl TALKING TO FOXY DIRECTLY
 robojudo needs Python 3.12 (Humble's only numpy2-compatible rclpy build coexists with onnxruntime;
 every Humble/py3.11 rclpy build in RoboStack forces numpy<2, which breaks onnxruntime outright --
 confirmed by direct test, not assumption). The G1's onboard ROS2 is Foxy (Python 3.8). Whether a
 Humble rclpy node and a Foxy rclpy node actually interoperate over the DDS/RTPS wire on the same
-host is UNVERIFIED here: reconstructing a Foxy rclpy in this sandbox to test it hit real, unfixable
-C++ ABI breaks (spdlog/fmt version skew from RoboStack's Foxy channel being EOL and unmaintained),
-so the cross-distro pub/sub test was never actually run.
+host is UNVERIFIED here: reconstructing a Foxy rclpy in an isolated sandbox to test it hit real,
+unfixable C++ ABI breaks (spdlog/fmt version skew from RoboStack's Foxy channel being EOL and
+unmaintained), so the cross-distro pub/sub test was never actually run.
 
 Rather than bet a physical robot on an unverified DDS interop link, this script keeps Humble and
-Foxy from ever having to talk to each other over DDS at all: it runs entirely INSIDE Foxy (so
-rclpy talking to rclpy is same-distro, zero ABI risk) and hands off to robojudo over Redis instead
--- the same, already-verified transport dummy_ball_perception.py uses for sim testing. robojudo's
-BallPoseRedisCtrl is completely unmodified and unaware this bridge exists.
+Foxy from ever having to talk to each other over DDS at all: it runs entirely INSIDE Foxy (so rclpy
+talking to rclpy is same-distro, zero ABI risk) and hands off to robojudo over UDP instead.
+robojudo's BallPoseUdpCtrl is a small, dependency-free listener built specifically for this.
 
-TOPIC CONTRACT (matches robojudo/controller/ball_pose_ros2_ctrl.py's BallPoseRos2Ctrl exactly, so
-a real detector can be written once and pointed at either consumer without caring which one is
+TOPIC CONTRACT (matches robojudo/controller/ball_pose_ros2_ctrl.py's BallPoseRos2Ctrl exactly, so a
+real detector can be written once and pointed at either consumer without caring which one is
 actually listening):
   /ball_pose (geometry_msgs/PointStamped)   -- required. Robot heading frame (x-forward, z-up).
       No detection this tick = don't publish; do not publish a stale/fabricated position.
@@ -36,12 +43,17 @@ permissive a subscriber can offer), matching BallPoseRos2Ctrl's own default, so 
 regardless of whether your detector publishes BEST_EFFORT or RELIABLE.
 
 STALENESS
-Redis staleness (BallPoseRedisCtrl.stale_after_s, default 0.5s) is judged against the "t" field
-this bridge writes. To keep that honest end-to-end (a ball detector that silently stopped tracking
-should read as stale in robojudo too, not as "still fresh because the bridge kept republishing the
-last value"), "t" is the ROS2 message's own header stamp when set, NOT this process's own
-wall-clock time at relay -- so a frozen upstream publisher shows up as a growing age, exactly like
-a frozen dummy_ball_perception.py would.
+BallPoseUdpCtrl's staleness check (default 0.5s) is judged against the "t" field this bridge sends.
+To keep that honest end-to-end (a ball detector that silently stopped tracking should read as stale
+in robojudo too, not as "still fresh because the bridge kept re-sending the last value"), "t" is
+the ROS2 message's own header stamp when set, NOT this process's own wall-clock time at relay -- so
+a frozen upstream publisher shows up as a growing age, exactly like a frozen
+dummy_ball_perception.py would.
+
+UDP has no delivery guarantee and no connection state -- both a correct fit here, not a compromise:
+a dropped datagram just means the next one (arriving ~33ms later at 30Hz) supersedes it, and
+there's nothing to "reconnect" after a network blip, unlike Redis or a TCP link. Nothing extra is
+needed to tolerate loss -- the staleness check already existed to handle exactly this kind of gap.
 """
 
 from __future__ import annotations
@@ -49,10 +61,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import time
-
-import redis
-from redis.exceptions import RedisError
+import socket
 
 import rclpy
 from geometry_msgs.msg import PointStamped, Vector3Stamped
@@ -77,20 +86,24 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--ball-topic", default="/ball_pose", help="geometry_msgs/PointStamped, robot heading frame.")
     ap.add_argument("--aim-topic", default="/kick_aim", help="geometry_msgs/Vector3Stamped, optional.")
     ap.add_argument("--node-name", default="foxy_ros2_ball_bridge")
-    ap.add_argument("--redis-host", default="localhost")
-    ap.add_argument("--redis-port", type=int, default=6379)
-    ap.add_argument("--redis-db", type=int, default=0)
-    ap.add_argument("--redis-key", default="ball_pose_g1", help="Must match BallPoseRedisCtrlCfg.redis_key.")
+    ap.add_argument(
+        "--dest-host", default="localhost",
+        help="Host running run_pipeline_prepared.py --ball-source udp. If robojudo runs on a "
+        "different machine than this bridge, this must be that machine's real address, not localhost.",
+    )
+    ap.add_argument(
+        "--dest-port", type=int, default=7790,
+        help="Must match BallPoseUdpCtrlCfg.listen_port / run_pipeline_prepared.py's --udp-listen-port.",
+    )
     return ap.parse_args()
 
 
 class Bridge(Node):
-    def __init__(self, args: argparse.Namespace, redis_client: redis.Redis):
+    def __init__(self, args: argparse.Namespace, sock: socket.socket, dest: tuple[str, int]):
         super().__init__(args.node_name)
-        self.redis_client = redis_client
-        self.redis_key = args.redis_key
+        self.sock = sock
+        self.dest = dest
         self.aim = [0.0, 0.0]
-        self._redis_failing = False  # throttle: warn once per failure streak, not every message
 
         qos = QoSProfile(
             depth=5,
@@ -102,7 +115,7 @@ class Bridge(Node):
         self.create_subscription(Vector3Stamped, args.aim_topic, self._on_aim, qos)
         logger.info(
             f"Subscribed to '{args.ball_topic}' (PointStamped) and '{args.aim_topic}' (Vector3Stamped) "
-            f"-- relaying to redis key '{self.redis_key}' on {args.redis_host}:{args.redis_port}/{args.redis_db}."
+            f"-- relaying to {dest[0]}:{dest[1]} over UDP."
         )
 
     def _on_aim(self, msg: Vector3Stamped):
@@ -123,33 +136,19 @@ class Bridge(Node):
                 "t": t,
             }
         )
-        try:
-            self.redis_client.set(self.redis_key, payload)
-            self._redis_failing = False
-        except RedisError as e:
-            if not self._redis_failing:
-                logger.warning(f"Lost redis connection ({e}), will keep retrying silently until it recovers...")
-                self._redis_failing = True
-
-
-def connect_redis(host: str, port: int, db: int) -> redis.Redis:
-    while True:
-        try:
-            client = redis.Redis(host=host, port=port, db=db, socket_timeout=1, socket_connect_timeout=1)
-            client.ping()
-            logger.info(f"Connected to redis at {host}:{port}/{db}")
-            return client
-        except Exception as e:
-            logger.error(f"Redis connect failed ({e}), retrying...")
-            time.sleep(0.5)
+        # No try/except needed: unlike a Redis SET or a TCP send, a UDP sendto() on a connectionless
+        # socket doesn't raise on "the other side isn't listening" -- it's fire-and-forget by design,
+        # which is exactly the semantics wanted here (see this module's STALENESS section).
+        self.sock.sendto(payload.encode("utf-8"), self.dest)
 
 
 def main() -> int:
     args = parse_args()
-    redis_client = connect_redis(args.redis_host, args.redis_port, args.redis_db)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    dest = (args.dest_host, args.dest_port)
 
     rclpy.init()
-    node = Bridge(args, redis_client)
+    node = Bridge(args, sock, dest)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
@@ -157,6 +156,7 @@ def main() -> int:
     finally:
         node.destroy_node()
         rclpy.shutdown()
+        sock.close()
     return 0
 
 

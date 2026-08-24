@@ -450,7 +450,7 @@ class UnifiedLocoKickPolicy(Policy):
     # contract (see ball_pose_redis_ctrl.py / ball_pose_ros2_ctrl.py) -- only one is ever wired into
     # a given pipeline's controller list (run_pipeline_prepared.py's --ball-source), so at most one
     # of these keys is present in ctrl_data at a time.
-    _LIVE_BALL_CTRL_TYPES = ("BallPoseRedisCtrl", "BallPoseRos2Ctrl")
+    _LIVE_BALL_CTRL_TYPES = ("BallPoseRedisCtrl", "BallPoseRos2Ctrl", "BallPoseUdpCtrl")
 
     def _get_live_ball_obs(self, ctrl_data: dict) -> tuple[np.ndarray | None, np.ndarray | None]:
         """Pull the latest kick_ball_pos_b/kick_target_pos_b from whichever live-ball controller

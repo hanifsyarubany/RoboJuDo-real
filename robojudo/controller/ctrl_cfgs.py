@@ -199,3 +199,21 @@ class BallPoseRos2CtrlCfg(CtrlCfg):
     qos_reliable: bool = False  # BEST_EFFORT by default -- see module docstring for why
 
     stale_after_s: float = 0.5  # treat a ball reading older than this as "no detection" (falls back to zero)
+
+
+class BallPoseUdpCtrlCfg(CtrlCfg):
+    """Third sibling of BallPoseRedisCtrlCfg/BallPoseRos2CtrlCfg -- same live kick_ball_pos_b/
+    kick_target_pos_b contract, carried over a plain UDP socket instead of Redis or ROS2 topics.
+    Exists specifically for real-hardware deployments where Redis cannot be installed/run at all
+    (confirmed on a real G1 -- not a theoretical concern) -- this uses only the Python stdlib on
+    both ends (no pip/apt install of anything, on either the Foxy detector/bridge side or this
+    robojudo side), and has no daemon/server process beyond the two application processes that
+    were going to run anyway. See ball_pose_udp_ctrl.py."""
+
+    ctrl_type: str = "BallPoseUdpCtrl"
+
+    listen_host: str = "0.0.0.0"  # interface this process listens on; 0.0.0.0 = all interfaces
+    listen_port: int = 7790
+
+    buffer_size: int = 5  # matches BallPoseRedisCtrlCfg.buffer_size
+    stale_after_s: float = 0.5  # treat a ball reading older than this as "no detection" (falls back to zero)
