@@ -102,8 +102,17 @@ class MujocoEnv(Environment):
 
     def update(self, simple=False):  # TODO: clean sensors in xml
         """simple: only update dof pos & vel"""
-        dof_pos = self.data.qpos.astype(np.float32)[-self.num_dofs :]
-        dof_vel = self.data.qvel.astype(np.float32)[-self.num_dofs :]
+        # Explicit bounded slice, not [-num_dofs:]: the robot's freejoint (7 qpos / 6 qvel) is
+        # assumed first (see base_pos/quat below, which hardcode qpos[:3]/qpos[3:7]), and its
+        # num_dofs joints immediately follow. [-num_dofs:] only happens to agree with that when
+        # the robot is the ENTIRE model -- any body added after the robot (e.g. a kickable ball
+        # freejoint) silently corrupts dof_pos/dof_vel into a mix of the robot's own tail joints
+        # and the extra body's raw qpos/qvel, since the slice keeps grabbing the last N regardless
+        # of what's now sitting there. This slice is mathematically identical to [-num_dofs:] for
+        # a robot-only model (qpos[7:7+num_dofs] == qpos[-num_dofs:] when nq == 7+num_dofs) and
+        # correct for any scene with extra bodies appended after the robot.
+        dof_pos = self.data.qpos.astype(np.float32)[7 : 7 + self.num_dofs]
+        dof_vel = self.data.qvel.astype(np.float32)[6 : 6 + self.num_dofs]
 
         self._dof_pos = dof_pos.copy()
         self._dof_vel = dof_vel.copy()

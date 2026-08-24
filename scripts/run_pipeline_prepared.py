@@ -6,10 +6,13 @@ if platform.machine().startswith("aarch64"):
     os.environ["OMP_NUM_THREADS"] = "1"
 
 import argparse
+import json
 import logging
 import time
 
 import numpy as np
+import redis
+from redis.exceptions import RedisError
 
 # import robojudo.pipeline (and therefore torch, via robojudo/__init__.py) BEFORE mujoco. On some
 # platforms (seen on the G1 onboard computer) importing mujoco first exhausts glibc's static TLS
@@ -19,6 +22,8 @@ import numpy as np
 # module scope at all, so it never hit this; keep torch loading first here too.
 import robojudo.pipeline
 from robojudo.config.config_manager import ConfigManager
+from robojudo.config.g1.env.g1_holosoma_env_cfg import HOLOSOMA_SCENE_WITH_BALL
+from robojudo.controller.ctrl_cfgs import BallPoseRedisCtrlCfg
 from robojudo.pipeline.pipeline_cfgs import RlPipelineCfg
 from robojudo.pipeline.rl_pipeline import RlPipeline
 
@@ -50,8 +55,95 @@ def parse_args():
             "tick action jump) are logged as warnings."
         ),
     )
+    parser.add_argument(
+        "--live-ball",
+        action="store_true",
+        help=(
+            "Feed the policy LIVE kick_ball_pos_b/kick_target_pos_b (instead of the hardcoded "
+            "zero) by adding a BallPoseRedisCtrl to the pipeline's controllers -- it polls Redis "
+            "for readings published by a separate perception process, in another terminal: "
+            "scripts/dummy_ball_perception.py for sim testing today, a real onboard detector "
+            "publishing to the same key/shape on the robot later (see --redis-host/--ball-redis-key). "
+            "In sim, also swaps in scene_g1_29dof_with_ball.xml (a physical ball to actually kick) "
+            "and PUBLISHES this process's own robot pose, plus the ball's TRUE current world "
+            "position (it moves when the robot's legs/feet push it -- reporting a fixed spawn point "
+            "would silently drift arbitrarily far from what's visible in the viewer), to "
+            "--robot-redis-key every tick. On real hardware there's no MuJoCo scene to swap and "
+            "nothing true to publish (a real camera-based detector reports relative to itself for "
+            "free, and has no ground truth either), so this only wires the controller."
+        ),
+    )
+    parser.add_argument(
+        "--redis-host",
+        type=str,
+        default=BallPoseRedisCtrlCfg().redis_host,
+        help="Only used with --live-ball. Redis host shared by both the ball-pose and robot-pose channels.",
+    )
+    parser.add_argument(
+        "--ball-redis-key",
+        type=str,
+        default=BallPoseRedisCtrlCfg().redis_key,
+        help="Only used with --live-ball. Redis key the perception process publishes ball pose to.",
+    )
+    parser.add_argument(
+        "--robot-redis-key",
+        type=str,
+        default="robot_pose_g1",
+        help=(
+            "Only used with --live-ball in sim. Redis key this process publishes its own "
+            "base_pos_w/base_quat_xyzw to every tick, for the perception process to consume."
+        ),
+    )
     args = parser.parse_args()
     return args
+
+
+class BallRespawner:
+    """--live-ball only: teleports the physical MuJoCo ball back to a nominal spawn position every
+    time a kick ends (auto-return-after-clip-finishes, or a manual [RETURN_TO_LOCO]), so the NEXT
+    kick -- whether it repeats the same skill or a different one via [CYCLE_KICK_SKILL]/`j` -- always
+    starts from an in-distribution ball position, matching training's per-episode ball reset. Without
+    this, the ball just stays wherever physics left it after being kicked (often far downfield, near
+    the target) -- badly out-of-distribution for the next kick, and the actual cause of "robust the
+    1st time, falls the 2nd" reports (confirmed: [CYCLE_KICK_SKILL] itself never touches env state --
+    see unified_loco_kick_policy.py's docstring -- so this was never a cycling bug).
+
+    Detects the kick-end transition by polling `inner_policy.task_mode` tick-to-tick (same pattern
+    DryRunSafetyMonitor already uses for the same field) rather than adding an event/callback to
+    UnifiedLocoKickPolicy itself, which stays environment-agnostic (it never touches env.data/model,
+    so it also works unmodified against real hardware, where there's obviously nothing to teleport).
+    """
+
+    DEFAULT_BALL_XY = (1.3, 0.0)  # scene_g1_29dof_with_ball.xml's own ball body spawn (x, y)
+    BALL_Z = 0.11  # ball radius -- resting exactly on the floor, same as the scene's spawn/keyframe
+
+    def __init__(self, pipeline, ball_qpos_addr: int, ball_qvel_addr: int):
+        self.env = pipeline.env
+        self.inner_policy = pipeline.policy.policy  # UnifiedLocoKickPolicy (unwrap PolicyWrapper)
+        self.ball_qpos_addr = ball_qpos_addr
+        self.ball_qvel_addr = ball_qvel_addr
+        self._prev_task_mode = self.inner_policy.task_mode
+
+    def check_and_respawn(self):
+        task_mode = self.inner_policy.task_mode
+        if self._prev_task_mode == "kick" and task_mode == "locomotion":
+            self._respawn()
+        self._prev_task_mode = task_mode
+
+    def _respawn(self):
+        skill_id = self.inner_policy.kick_skill_id
+        xy = self.inner_policy.get_skill_ball_xy(skill_id)
+        x, y = xy if xy is not None else self.DEFAULT_BALL_XY
+
+        addr = self.ball_qpos_addr
+        self.env.data.qpos[addr : addr + 3] = [x, y, self.BALL_Z]
+        self.env.data.qpos[addr + 3 : addr + 7] = [1.0, 0.0, 0.0, 0.0]  # identity quat, wxyz
+        vaddr = self.ball_qvel_addr
+        self.env.data.qvel[vaddr : vaddr + 6] = 0.0  # no residual roll/spin from the last kick
+
+        mujoco.mj_forward(self.env.model, self.env.data)
+        self.env.update()
+        logger.info(f"[live-ball] kick ended (skill {skill_id}) -- respawned ball at ({x:.2f}, {y:.2f}, {self.BALL_Z:.2f})")
 
 
 class DryRunSafetyMonitor:
@@ -208,6 +300,31 @@ def main():
 
     cfg: RlPipelineCfg = config_manager.get_cfg()
 
+    robot_pose_redis_client = None
+    if args.live_ball:
+        cfg.ctrl.append(BallPoseRedisCtrlCfg(redis_host=args.redis_host, redis_key=args.ball_redis_key))
+        if cfg.env.is_sim:
+            cfg.env.xml = HOLOSOMA_SCENE_WITH_BALL
+            robot_pose_redis_client = redis.Redis(host=args.redis_host, port=6379, db=0)
+            logger.warning(
+                f"--live-ball: spawning a physical ball in the MuJoCo scene ({HOLOSOMA_SCENE_WITH_BALL}), "
+                f"reading kick_ball_pos_b/kick_target_pos_b live from redis key '{args.ball_redis_key}', "
+                f"and publishing this process's own robot pose PLUS the ball's true world position to "
+                f"'{args.robot_redis_key}' every tick (on {args.redis_host}). Start the perception "
+                f"stream in another terminal now if you haven't -- e.g. "
+                f"'python scripts/dummy_ball_perception.py --redis-host {args.redis_host} "
+                f"--redis-key {args.ball_redis_key} --robot-redis-key {args.robot_redis_key}' -- "
+                f"pipeline construction below will block waiting for its first ball reading."
+            )
+        else:
+            logger.warning(
+                f"--live-ball: no MuJoCo scene swap or robot-pose publish on real hardware (dynamics "
+                f"are the physical robot, and a real camera-based detector already reports relative "
+                f"to itself without needing this) -- reading kick_ball_pos_b/kick_target_pos_b live "
+                f"from redis key '{args.ball_redis_key}' on {args.redis_host}. Point your real "
+                f"perception process at the same key/shape (see scripts/dummy_ball_perception.py)."
+            )
+
     pipeline_type = cfg.pipeline_type
 
     pipeline_class: type[RlPipeline] = getattr(robojudo.pipeline, pipeline_type)
@@ -221,6 +338,7 @@ def main():
         logger.warning("The robot/sim will NOT move. Unsafe-looking actions are logged as warnings.")
         logger.warning("=" * 78)
 
+    ball_qpos_addr = None
     if cfg.env.is_sim:
         env = pipeline.env
         if mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_KEY, "default_stand") < 0:
@@ -232,6 +350,24 @@ def main():
         mujoco.mj_forward(env.model, env.data)
         env.update()
         logger.warning(f"Sim: reset to 'default_stand' keyframe, base_z={env.data.qpos[2]:.3f}")
+
+        if args.live_ball:
+            # The dummy/real perception process needs the ball's TRUE simulated position, not just
+            # the robot's -- a fixed/fabricated ball position drifts arbitrarily far from what's
+            # actually visible in the viewer the moment the robot's feet/legs push the physical
+            # ball around, which is exactly what makes "walk up to the visible ball" testing
+            # meaningless without this. This is still not a "ball-perception shortcut" in the sense
+            # that matters for sim2real: on real hardware there IS no true ball position to read
+            # (see the else-branch warning below), so a real detector still has to do real
+            # perception there -- this only removes the SIM-SIDE gap between what you see and what
+            # gets reported, which a real camera wouldn't have in the first place.
+            ball_jid = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_JOINT, "ball_freejoint")
+            if ball_jid >= 0:
+                ball_qpos_addr = int(env.model.jnt_qposadr[ball_jid])
+                ball_qvel_addr = int(env.model.jnt_dofadr[ball_jid])
+            else:
+                ball_qvel_addr = None
+                logger.warning("--live-ball: no 'ball_freejoint' in this scene -- can't publish true ball position.")
     elif args.dry_run:
         logger.warning(
             "Real hardware + --dry-run: skipping pipeline.prepare() (it physically ramps the "
@@ -242,12 +378,42 @@ def main():
         pipeline.prepare()
 
     safety_monitor = DryRunSafetyMonitor(pipeline) if args.dry_run else None
+    ball_respawner = (
+        BallRespawner(pipeline, ball_qpos_addr, ball_qvel_addr) if ball_qpos_addr is not None else None
+    )
+
+    _robot_pose_publish_failing = False  # throttle: warn once per failure streak, not every tick
 
     while True:
         time_start = time.time()
         pipeline.step(dry_run=args.dry_run)
         if safety_monitor is not None:
             safety_monitor.check_and_log()
+        if ball_respawner is not None and not args.dry_run:
+            # --dry-run applies no torque (env.step() skipped) -- teleporting the ball there would
+            # still visibly move it despite "nothing physically moves" being the documented contract.
+            ball_respawner.check_and_respawn()
+
+        if robot_pose_redis_client is not None:
+            # The dummy/real perception process needs the robot's own pose to correctly compute how
+            # the ball's position in the robot's frame changes as the robot walks (pure geometry),
+            # PLUS -- in sim, when a physical ball is in the scene -- the ball's true current world
+            # position, since the robot can physically push/kick it away from wherever it spawned
+            # (see ball_qpos_addr's setup above for why this stopped being optional).
+            try:
+                payload = {
+                    "base_pos_w": np.asarray(pipeline.env.base_pos).tolist(),
+                    "base_quat_xyzw": np.asarray(pipeline.env.base_quat).tolist(),
+                    "t": time_start,
+                }
+                if ball_qpos_addr is not None:
+                    payload["ball_pos_w"] = pipeline.env.data.qpos[ball_qpos_addr : ball_qpos_addr + 3].tolist()
+                robot_pose_redis_client.set(args.robot_redis_key, json.dumps(payload))
+                _robot_pose_publish_failing = False
+            except RedisError as e:
+                if not _robot_pose_publish_failing:
+                    logger.warning(f"[live-ball] failed to publish robot/ball pose to redis: {e}")
+                    _robot_pose_publish_failing = True
         time_end = time.time()
         time_diff = time_end - time_start
 

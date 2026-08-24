@@ -6,8 +6,8 @@ same pattern as G1BeyondMimicPolicyCfg). The joint order matches RoboJuDo's G1 e
 
 ``onnx_path`` and ``default_dof_pos`` are the only things you must get right per-checkpoint:
 - onnx_path: the exported unified policy (a Stage-B checkpoint by default; a Stage-C checkpoint
-  works too, but a Stage-C deploy would additionally need a real dynamic ball reading -- not wired
-  here yet, see the holosoma repo README v9).
+  works too, and can now get a real dynamic ball reading via run_pipeline_prepared.py's --live-ball
+  flag, see g1_unified_loco_kick_cfg.py's PERCEPTION section).
 - default_dof_pos: the training robot config's default joint pose. dof_pos observations are
   measured relative to it, so it must match training exactly (verified against the golden obs).
 """
@@ -18,8 +18,8 @@ from robojudo.tools.tool_cfgs import DoFConfig
 # Default: the Stage-B "ballobs-gated" checkpoint the user has been sim2sim-testing. Override with
 # --policy.onnx-path <path> or by editing here.
 # DEFAULT_ONNX_PATH = (
-#     "/workspaces/isaaclab_arena/submodules/workspaces/playground/locomotion_and_ball_kicking/logs/"
-#     "LocomotionAndBallKicking/20260712_083233-unified-stageB-ballobs-gated-locomotion/model_0119000.onnx"
+#     "/workspaces/isaaclab_arena/submodules/workspaces/playground/unified_ball_kicking_skills/logs/"
+#     "LocomotionAndBallKicking/20260801_150030-unified-stageC-2skills-locomotion/model_0437000.onnx"
 # )
 # DEFAULT_ONNX_PATH = (
 #     "assets/motions/g1/football_play/"
@@ -30,11 +30,35 @@ from robojudo.tools.tool_cfgs import DoFConfig
 #     "20260711_032532-unified-stageA-locomotion-locomotion/model_0015000.onnx"
 # )
 
-DEFAULT_ONNX_PATH = (
-    "assets/motions/g1/football_play/"
-    "20260714_150605-unified-stageB-ballobs-gated-v10-locomotion/model_0145000.onnx"
-)
+# DEFAULT_ONNX_PATH = (
+#     "assets/motions/g1/football_play/"
+#     "20260714_150605-unified-stageB-ballobs-gated-v10-locomotion/model_0145000.onnx"
+# )
 
+# DEFAULT_ONNX_PATH = (
+#     "/workspaces/isaaclab_arena/submodules/workspaces/playground/unified_ball_kick_robonaldo/logs/"
+#     "RoboNaldoBallKicking/20260810_082502-stageD-1skill-locomotion/model_0330000.onnx"
+# )
+
+# DEFAULT_ONNX_PATH = (
+#     "/workspaces/isaaclab_arena/submodules/workspaces/playground/unified_ball_kick_robonaldo/logs/"
+#     "RoboNaldoBallKicking/20260814_003043-stageD-1skill-handoff-locomotion/model_0385000.onnx"
+# )
+
+# DEFAULT_ONNX_PATH = (
+#     "/workspaces/isaaclab_arena/submodules/workspaces/playground/unified_ball_kick_robonaldo/logs/"
+#     "RoboNaldoBallKicking/20260813_005001-stageC1-1skill-locoflip-shooting05-new-fixes-3-locomotion/model_0325000.onnx"
+# )
+
+# DEFAULT_ONNX_PATH = (
+#     "/workspaces/isaaclab_arena/submodules/workspaces/playground/unified_ball_kick_robonaldo/logs/"
+#     "RoboNaldoBallKicking/20260814_021015-stageC-1skill-locoflip-shooting05-new-fixes-4-locomotion/model_0400000.onnx"
+# )
+
+DEFAULT_ONNX_PATH = (
+    "/workspaces/isaaclab_arena/submodules/workspaces/playground/unified_ball_kick_enhanced/logs/"
+    "UnifiedBallKickingEnhanced/20260823_113321-stageB-skill011-h076-locomotion/model_0165000.onnx"
+)
 
 class G1UnifiedLocoKickDoF(DoFConfig):
     # 29-DoF G1, exactly the ONNX dof_names order (== RoboJuDo G1 env order). Placeholder only:

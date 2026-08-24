@@ -300,7 +300,11 @@ class Callbacks:
                 if selbody >= 0:
                     # record selection
                     self.pert.select = selbody
-                    self.pert.skinselect = selskin
+                    # selskin is the (1,1) int32 array mjv_select wrote its output into -- newer
+                    # mujoco/pybind11 rejects assigning a numpy array to this scalar-int property
+                    # directly (TypeError: incompatible function arguments), unlike self.pert.select
+                    # above which is already a plain int (mjv_select's return value, not an out-param).
+                    self.pert.skinselect = int(selskin.item())
                     # compute localpos
                     vec = selpnt.flatten() - self.data.xpos[selbody]
                     mat = self.data.xmat[selbody].reshape(3, 3)

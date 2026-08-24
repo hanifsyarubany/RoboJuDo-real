@@ -1,0 +1,65 @@
+<!-- Ball-augmented copy of scene_g1_29dof.xml, built for a one-off root-cause verification test
+(2026-07-17): does feeding the Stage-C unified loco+kick policy a REAL ball/target observation
+(matching training) instead of RoboJuDo's hardcoded zero fix the sim2sim kick fall?
+
+Adds a single freely-simulated, kickable ball body, using the EXACT same geom parameters holosoma's
+own MuJoCo backend uses (see playground/locomotion_and_ball_kicking/src/holosoma/holosoma/simulator/
+mujoco/scene_manager.py::add_ball): sphere radius 0.11, mass 0.43, friction=[dynamic_friction, 0.005,
+0.0001] with the run's actual resolved dynamic_friction=0.6, condim=4, contype=1, conaffinity=7 (so
+it collides with the floor -- default conaffinity=1 -- and the robot's own geoms). Added AFTER the
+robot body (via <include>, which comes first) so the robot's freejoint stays the first free joint in
+the compiled model, matching holosoma's own ordering assumption.
+
+Ball spawn (1.3, 0, 0.11) is chosen relative to the robot's known, fixed keyframe spawn (origin,
+identity quat, facing +x) to approximate training's own docstring-documented ball_pos_b magnitude
+at kick-clip start (~1.38m) -- see managers/observation/terms/unified.py::ball_pos_b's docstring.
+The keyframe qpos is extended with 7 more values (ball freejoint: pos + wxyz quat) to match the
+model's new nq after adding the ball's freejoint. -->
+<mujoco model="g1_29dof_holosoma_scene_with_ball">
+  <include file="g1_29dof.xml"/>
+
+  <statistic center="1.0 0.7 1.0" extent="0.8"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.1 0.1 0.1" specular="0.9 0.9 0.9"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="-140" elevation="-20"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="flat" rgb1="0 0 0" rgb2="0 0 0" width="512" height="3072"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4"
+             rgb2="0.1 0.2 0.3" markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
+  </asset>
+
+  <worldbody>
+    <light pos="1 0 3.5" dir="0 0 -1" directional="true"/>
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
+
+    <body name="ball" pos="1.3 0 0.11">
+      <freejoint name="ball_freejoint"/>
+      <geom name="ball_geom" type="sphere" size="0.11" mass="0.43"
+            friction="0.6 0.005 0.0001" condim="4" contype="1" conaffinity="7"
+            rgba="0.9 0.25 0.1 1.0"/>
+    </body>
+  </worldbody>
+
+  <!-- Holosoma's trained default standing pose, grounded (base z chosen so the lowest foot
+  collision capsule just touches z=0 -- computed by forward-kinematics, not guessed; see
+  scripts/run_pipeline_prepared.py, which resets to this keyframe before the control loop starts
+  in sim). Without this, MjData() initializes every joint to q=0 (straight legs) since the
+  included robot XML has no keyframe of its own -- corrupting every dof_pos-relative observation
+  from tick zero. Values = base pos/quat(wxyz) + the 29 joint angles in kinematic-tree order,
+  followed by the ball freejoint's pos/quat(wxyz) appended at the end (compiled joint order). -->
+  <keyframe>
+    <key name="default_stand"
+         qpos="0 0 0.756464 1 0 0 0
+               -0.312 0 0 0.669 -0.363 0
+               -0.312 0 0 0.669 -0.363 0
+               0 0 0
+               0.2 0.2 0 0.6 0 0 0
+               0.2 -0.2 0 0.6 0 0 0
+               1.3 0 0.11 1 0 0 0"/>
+  </keyframe>
+</mujoco>

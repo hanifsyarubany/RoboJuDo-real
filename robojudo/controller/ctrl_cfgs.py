@@ -161,3 +161,20 @@ class TwistRedisCtrlCfg(CtrlCfg):
     redis_key: str = "action_mimic_g1"  # key to get command data from redis
 
     buffer_size: int = 5  # size of the data buffer to store recent commands
+
+
+class BallPoseRedisCtrlCfg(CtrlCfg):
+    """Live kick_ball_pos_b/kick_target_pos_b from an external perception process, same
+    Redis-poll pattern as TwistRedisCtrl. The producer is swappable -- scripts/dummy_ball_perception.py
+    for sim testing today, a real onboard detector publishing to the same key on the robot later --
+    with no change needed on the consumer (UnifiedLocoKickPolicy) side. See ball_pose_redis_ctrl.py."""
+
+    ctrl_type: str = "BallPoseRedisCtrl"
+
+    redis_host: str = "localhost"
+    redis_port: int = 6379
+    redis_db: int = 0
+    redis_key: str = "ball_pose_g1"  # key to get live ball-pose data from redis
+
+    buffer_size: int = 5  # size of the data buffer to store recent readings
+    stale_after_s: float = 0.5  # treat a reading older than this as "no detection" (falls back to zero)

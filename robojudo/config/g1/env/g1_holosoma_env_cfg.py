@@ -24,6 +24,15 @@ from .g1_real_env_cfg import G1RealEnvCfg, G1UnitreeCfg
 # lacks); the calibrated dynamics come from the included robot XML unchanged.
 _HOLOSOMA_SCENE = (ASSETS_DIR / "robots/g1/holosoma_model/scene_g1_29dof.xml").as_posix()
 
+# Same scene plus a single freely-simulated, kickable ball body (same geom params as holosoma's own
+# MuJoCo backend -- see that scene XML's header comment). Used by run_pipeline_prepared.py's
+# --live-ball flag so the robot has something physical to actually kick while a BallPoseRedisCtrl
+# feeds the policy live kick_ball_pos_b/kick_target_pos_b (see ball_pose_redis_ctrl.py). Keeps the
+# same "default_stand" keyframe name (extended with the ball's 7 extra qpos values), so nothing else
+# about the launch sequence needs to change. Public (no leading underscore, unlike _HOLOSOMA_SCENE
+# above) since run_pipeline_prepared.py imports it directly.
+HOLOSOMA_SCENE_WITH_BALL = (ASSETS_DIR / "robots/g1/holosoma_model/scene_g1_29dof_with_ball.xml").as_posix()
+
 # Torque limits = holosoma's actuator ctrlrange (Nm), in dof order. The env clips torque to these
 # in Python; setting them equal to the XML's actuator ctrlrange keeps the two consistent (RoboJuDo's
 # stock values over-clip the ankle at 40 vs holosoma's 50, which hurts standing balance).

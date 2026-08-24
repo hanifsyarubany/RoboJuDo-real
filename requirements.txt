@@ -11,6 +11,7 @@ zmq
 pynput
 pydantic
 mujoco
+redis
 msgpack
 msgpack-numpy
 colorlog

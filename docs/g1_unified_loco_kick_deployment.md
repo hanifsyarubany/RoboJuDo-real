@@ -163,9 +163,16 @@ Works identically in sim and real (when `CONTROLLER` includes `"keyboard"`).
 | `w` / `s` | forward / back |
 | `a` / `d` | strafe left / right |
 | `q` / `e` | turn left / right |
-| `k` | trigger kick |
+| `k` | trigger kick (kicks whichever skill is currently selected, see `j` below) |
+| `j` | cycle which kick skill `k` will trigger next (0 → 1 → ... → N-1 → 0). Doesn't kick, doesn't interrupt a kick in progress — only changes what the *next* `k` does. No-op on a single-skill checkpoint. |
 | `l` | return to locomotion (manual override — the kick also auto-returns once the clip finishes) |
 | `Esc` | emergency stop (`[SHUTDOWN]`) |
+
+**With `--live-ball` in sim**: the physical ball is automatically teleported back to the just-kicked
+skill's own nominal spawn position (zero velocity) the instant a kick ends (auto-return or `l`) — so
+the *next* kick (same skill via `k`, or a different one via `j` then `k`) always starts from an
+in-distribution ball position, matching training's per-episode reset, instead of wherever the ball
+physically rolled to after being kicked. Real hardware has no equivalent (a human resets the ball).
 
 **`g1_unified_loco_kick_amo` only** — switch which policy is active:
 
@@ -220,8 +227,9 @@ Layout reference (RB = right shoulder button, above RT; LB = left shoulder, abov
 
 | Combo | Effect |
 |---|---|
-| RB + D-pad Up | trigger kick |
+| RB + D-pad Up | trigger kick (kicks whichever skill is currently selected, see RB + X below) |
 | RB + D-pad Down | return to locomotion (manual override) |
+| RB + X | cycle which kick skill the trigger will kick next (0 → 1 → ... → N-1 → 0). Doesn't kick, safe to press mid-kick. No-op on a single-skill checkpoint. |
 
 **Other:**
 

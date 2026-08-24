@@ -41,8 +41,28 @@ CONTROLS
     keyboard : w/s forward/back, a/d strafe, q/e turn        joystick : left stick move, right stick turn
   Kick:
     keyboard : k = trigger kick, l = return to locomotion    joystick : RB+Up = kick, RB+Down = return
+    keyboard : j = cycle kick skill (0,1,2,...,0)             joystick : RB+X = cycle kick skill
+  (j / RB+X only changes WHICH skill the next k/RB+Up kicks -- it never kicks by itself, and
+   can be pressed any time, including mid-kick, with no effect on the motion in progress. The
+   selection persists across kicks/returns until changed again. If the checkpoint only has one
+   skill, cycling is a no-op.)
   (the kick auto-returns to locomotion when the clip finishes; l / RB+Down is a manual override)
   Stop: keyboard Esc / joystick A (emergency stop on real).
+
+PERCEPTION (optional)
+  By default kick_ball_pos_b/kick_target_pos_b are hardcoded zero (matches training). Pass
+  --live-ball to run_pipeline_prepared.py to feed live readings instead, from a BallPoseRedisCtrl
+  fed by a separate perception process running in another terminal -- see
+  scripts/dummy_ball_perception.py for sim testing and robojudo/controller/ball_pose_redis_ctrl.py
+  for the interface a real onboard detector would plug into the same way later.
+
+  AZIMUTH-AIM CHECKPOINTS (2026-08-22 refactor onward): if the ONNX at policy.onnx_path was
+  trained with SkillConfig.kick_aim_enabled=True (every skill in playground/
+  unified_ball_kick_enhanced as of 2026-08-24), dummy_ball_perception.py's DEFAULT --live-ball
+  reading (a world-frame target_pos_b transform) is silently out-of-distribution for it -- pass
+  that script its own --kick-aim-enabled (plus --kick-aim-theta-deg/--kick-aim-theta-ref-deg) flag
+  instead. See that script's module docstring for the full explanation; there is currently no ONNX
+  metadata that would let this be auto-detected, so getting this right is on you, the caller.
 """
 
 import logging
@@ -64,8 +84,11 @@ CONTROLLER = "both"  # "both" | "keyboard" | "joystick"
 NET_IF = "eth0"  # robot network interface (only for DEPLOY_TARGET="real")
 # =============================================================================== #
 
-_KB_KICK_TRIGGERS = {"k": "[TRIGGER_KICK]", "l": "[RETURN_TO_LOCO]"}
-_JS_KICK_TRIGGERS = {"RB+Up": "[TRIGGER_KICK]", "RB+Down": "[RETURN_TO_LOCO]"}
+_KB_KICK_TRIGGERS = {"k": "[TRIGGER_KICK]", "l": "[RETURN_TO_LOCO]", "j": "[CYCLE_KICK_SKILL]"}
+# RB+Left/RB+Right are taken by g1_unified_loco_kick_amo's policy_switch_triggers (merged into this
+# same dict there -- see _make_ctrl) for AMO<->unified switching, so cycle-skill uses RB+X instead
+# to avoid a silent collision in that config. X is unbound elsewhere in this policy's controls.
+_JS_KICK_TRIGGERS = {"RB+Up": "[TRIGGER_KICK]", "RB+Down": "[RETURN_TO_LOCO]", "RB+X": "[CYCLE_KICK_SKILL]"}
 
 # The real Unitree remote (UnitreeCtrl, via unitreeRemoteController.button_map) names its shoulder
 # buttons "L1"/"R1"; a generic gamepad (JoystickCtrl, via JoystickThread's Xbox-style button_map)
