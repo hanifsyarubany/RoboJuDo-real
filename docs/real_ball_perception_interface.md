@@ -62,9 +62,10 @@ header.frame_id  -- not consumed programmatically; put something meaningful for 
                      (e.g. "g1_heading_frame")
 point.x          -- ball position, forward axis, meters
 point.y          -- ball position, left axis, meters
-point.z          -- ball position, up axis, meters (≈ ball radius when resting on the ground,
-                     e.g. ~0.11 for a standard-size ball used in training — wildly different z
-                     is out-of-distribution for the policy)
+point.z          -- ball position, up axis, meters. Publish what you actually measure -- do NOT
+                     force a constant. See "When this actually matters" below: z naturally comes
+                     out ≈ ball radius (e.g. ~0.11) for a resting ball, but a real, moving,
+                     above-ground z is expected and IN-distribution once the ball has been struck.
 ```
 
 **If you don't see the ball, don't publish.** Do not publish a repeated/frozen last-known position,
@@ -72,6 +73,24 @@ and do not publish a guess. The whole staleness mechanism downstream (bridge →
 `BallPoseRedisCtrl`, `stale_after_s=0.5` by default) exists specifically so "detector lost track"
 correctly reads as **no detection** (the policy gets zeros, its trained fallback) rather than acting
 on stale data. Silence is the correct signal for "I don't currently see the ball."
+
+### When this actually matters — task-mode gating
+
+Verified directly against `robojudo/policy/unified_loco_kick_policy.py:385-419`: `kick_ball_pos_b`
+is only ever **consumed** while the robot's `task_mode` is `"kick"`. During locomotion (walking up
+to the ball, operator-driven via joystick/keyboard velocity commands — this policy does not
+autonomously navigate toward the ball at all), the term is unconditionally zeroed in the
+observation regardless of what you publish. It becomes live the instant a kick is triggered, and
+stays live **every tick, continuously, for the entire kick motion** — not captured once at the
+trigger moment. That includes the period *after* foot-ball contact, while the ball is airborne or
+rolling away: training's own simulated ball is a real rigid body that gets physically struck and
+keeps moving while `task_mode` is still `"kick"` (it's only reset once the mode flips back to
+locomotion — see `BallRespawner` in `run_pipeline_prepared.py`). A changing, above-ground `z`
+during that window is expected, not a fault.
+
+Practical implication: detector accuracy matters most starting the instant a kick is triggered and
+continuously through the strike — that's the only window the policy is actually reading. Getting
+`z` (or anything else) slightly wrong during the walk-up approach has no effect on this checkpoint.
 
 ### Example
 
