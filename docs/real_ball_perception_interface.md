@@ -14,9 +14,9 @@ real-deployment flow — this doc is specifically about the perception side of `
  REAL DETECTOR              BRIDGE                        ROBOJUDO
  (your code, new)     foxy_ros2_ball_bridge.py       (already built, unmodified)
  ┌──────────────┐     ┌──────────────────────┐       ┌───────────────────────────┐
- │  camera /    │ ROS2│  subscribes to the    │ Redis │ run_pipeline_prepared.py  │
- │  lidar, etc. │────▶│  same topics, writes  │──────▶│  --live-ball              │
- │              │     │  to redis             │       │  --ball-source redis      │
+ │  camera /    │ ROS2│  subscribes to the    │  UDP  │ run_pipeline_prepared.py  │
+ │  lidar, etc. │────▶│  same topics, sends   │──────▶│  --live-ball              │
+ │              │     │  a UDP datagram       │       │  --ball-source udp        │
  └──────────────┘     └──────────────────────┘       └───────────────────────────┘
    Foxy, native          Foxy, native                   Humble, py3.12
    (robot's own ROS2)    (same distro as detector,       (needs py3.12 for
@@ -31,10 +31,19 @@ is Foxy (Python 3.8). Whether a Humble node and a Foxy node actually interoperat
 is **unverified** — attempting to reconstruct Foxy's `rclpy` to test it hit real, unfixable C++ ABI
 breaks in RoboStack's (unmaintained) Foxy packaging. Rather than bet the robot on that, the bridge
 keeps ROS2 entirely inside Foxy (talking to itself — zero risk) and only crosses the Humble/Foxy
-boundary over Redis, a transport that's already verified working.
+boundary over UDP.
+
+**Why UDP, not Redis:** an earlier version of this bridge crossed that boundary over Redis instead.
+Redis was tried on a real G1 and confirmed impossible to get running there. Rather than chase a
+different specific technology that might hit the same unknown wall, UDP removes every third-party
+dependency from the whole chain: a plain socket, Python stdlib only, on both ends — no daemon, no
+server process, nothing to install anywhere beyond the two application processes (the bridge and
+`robojudo`) that were going to run anyway.
 
 **You only need to build the "REAL DETECTOR" box.** The bridge (`scripts/foxy_ros2_ball_bridge.py`)
-and everything on the `robojudo` side already exist and are already tested.
+and everything on the `robojudo` side already exist and are already tested — including a real
+staleness transition (a killed sender correctly flips the reading to invalid) and a full chain test
+from a stand-in ROS2 publisher through the bridge into `robojudo`'s own controller.
 
 ---
 
@@ -69,8 +78,8 @@ point.z          -- ball position, up axis, meters. Publish what you actually me
 ```
 
 **If you don't see the ball, don't publish.** Do not publish a repeated/frozen last-known position,
-and do not publish a guess. The whole staleness mechanism downstream (bridge → Redis →
-`BallPoseRedisCtrl`, `stale_after_s=0.5` by default) exists specifically so "detector lost track"
+and do not publish a guess. The whole staleness mechanism downstream (bridge → UDP →
+`BallPoseUdpCtrl`, `stale_after_s=0.5` by default) exists specifically so "detector lost track"
 correctly reads as **no detection** (the policy gets zeros, its trained fallback) rather than acting
 on stale data. Silence is the correct signal for "I don't currently see the ball."
 
@@ -215,14 +224,17 @@ If your robot sources ROS2 differently (custom install path, a wrapper script, e
 your existing onboard perception/driver stack already uses — the bridge just needs to run under
 that same environment.
 
-## 2. Install the bridge's one dependency
+## 2. Install the bridge's dependencies
 
-The bridge is deliberately minimal — no `robojudo` import, no torch, nothing that risks a repeat
-of the C++ ABI issues we hit trying to reconstruct Foxy elsewhere. Just:
+None. The bridge is deliberately dependency-free — no `robojudo` import, no torch, no third-party
+package on either end of the Humble/Foxy boundary at all (not even a pip install). It uses only
+`rclpy` (already native to Foxy) and the Python stdlib (`socket`, `json`). This is a deliberate
+design choice, not an incidental one: Redis was tried on a real G1 first and confirmed impossible
+to get running there, so the replacement was built to need nothing installable at all, rather than
+risk hitting the same unknown wall with a different specific technology. Sanity-check:
 
 ```bash
-pip install redis
-python3 -c "import redis; print('redis client OK')"
+python3 -c "import rclpy, socket, json; print('all good, nothing to install')"
 ```
 
 ## 3. Get the bridge script onto the robot
@@ -235,27 +247,16 @@ git pull   # picks up scripts/foxy_ros2_ball_bridge.py
 If the robot's onboard compute doesn't have the full `RoboJuDo` checkout, you only need this one
 self-contained file — copy it over directly (`scp scripts/foxy_ros2_ball_bridge.py <robot>:...`).
 
-## 4. Decide where Redis runs
+## 4. Decide on host/port
 
-`robojudo`'s default (`redis_host="localhost"`) assumes Redis is reachable at `localhost` **from
-wherever `run_pipeline_prepared.py` runs**. Two cases:
-
-- **Detector and `robojudo` on the same onboard computer:** run Redis there, everything defaults to
-  `localhost`, nothing else to configure.
-- **Detector runs on a different machine** (e.g. a separate perception computer, or `robojudo` run
-  from your workstation over Ethernet per `unitree_setup.md`'s "Deploy from Your Computer" option):
-  Redis needs to be reachable across that link. By default `redis-server` only binds to loopback —
-  you'll need to either run Redis on the `robojudo` host and point the bridge's `--redis-host` at
-  it, or reconfigure Redis to bind to a real network interface (`redis-server --bind
-  <robojudo-host-ip>`) and point `run_pipeline_prepared.py`'s `--redis-host` at that instead. Prefer
-  the first (Redis colocated with `robojudo`) — it's one fewer thing to reconfigure.
-
-Install Redis if it isn't already present:
-
-```bash
-sudo apt install redis-server   # or: conda install -c conda-forge redis-server
-redis-cli ping                   # should print PONG
-```
+`robojudo`'s default (`BallPoseUdpCtrlCfg.listen_host="0.0.0.0"`, `listen_port=7790`) listens on
+all interfaces, so it accepts datagrams from anywhere reachable — nothing to configure if the
+detector/bridge and `robojudo` run on the **same** onboard computer (point the bridge at
+`--dest-host localhost`). If they run on **different machines** (e.g. a separate perception
+computer, or `robojudo` run from your workstation over Ethernet per `unitree_setup.md`'s "Deploy
+from Your Computer" option), point the bridge's `--dest-host` at whichever machine's real address
+is running `robojudo`, and check nothing (a firewall, etc.) blocks UDP on that port between the two
+hosts — there's no separate service to configure or bind, just this one port.
 
 ## 5. Run the bridge
 
@@ -263,16 +264,17 @@ redis-cli ping                   # should print PONG
 source /opt/ros/foxy/setup.bash
 cd /path/to/RoboJuDo
 python3 scripts/foxy_ros2_ball_bridge.py
-# add --redis-host <ip> if Redis isn't on this same machine (see step 4)
+# add --dest-host <ip> if robojudo isn't on this same machine (see step 4)
 ```
 
 Expected log output:
 ```
-[INFO] Connected to redis at localhost:6379/0
-[INFO] Subscribed to '/ball_pose' (PointStamped) and '/kick_aim' (Vector3Stamped) -- relaying to redis key 'ball_pose_g1' ...
+[INFO] Subscribed to '/ball_pose' (PointStamped) and '/kick_aim' (Vector3Stamped) -- relaying to localhost:7790 over UDP.
 ```
 
 It will sit idle (no further logs) until your detector actually starts publishing — that's normal.
+UDP is connectionless, so unlike the Redis version there's no separate "connected" log line to wait
+for — the bridge doesn't know or care whether anything is listening on the other end yet.
 
 ## 6. Build and run your detector node
 
@@ -342,37 +344,46 @@ ros2 topic echo /ball_pose    # inspect actual values -- sanity-check the sign/m
                                # against where the ball actually is relative to the robot
 ```
 
-**b. The bridge is relaying correctly:**
+**b. The bridge is relaying correctly** — a raw one-off UDP listener, stdlib-only (binds the same
+port `robojudo` will use, so run this before starting `run_pipeline_prepared.py`, not alongside it):
 ```bash
-redis-cli get ball_pose_g1
-# expect: {"kick_ball_pos_b": [x, y, z], "kick_target_pos_b": [ax, ay], "t": <unix time>}
+python3 -c "
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(('0.0.0.0', 7790))
+print('listening on :7790, waiting for one datagram...')
+data, addr = s.recvfrom(4096)
+print('received from', addr, ':', data)
+"
+# expect: b'{"kick_ball_pos_b": [x, y, z], "kick_target_pos_b": [ax, ay], "t": <unix time>}'
 ```
 
 **c. `robojudo` reads it correctly** (from the `robojudo` host, `conda activate robojudo`):
 ```bash
 python -c "
-from robojudo.controller.ball_pose_redis_ctrl import BallPoseRedisCtrl
-from robojudo.controller.ctrl_cfgs import BallPoseRedisCtrlCfg
-ctrl = BallPoseRedisCtrl(cfg_ctrl=BallPoseRedisCtrlCfg(), env=None)
+from robojudo.controller.ball_pose_udp_ctrl import BallPoseUdpCtrl
+from robojudo.controller.ctrl_cfgs import BallPoseUdpCtrlCfg
+ctrl = BallPoseUdpCtrl(cfg_ctrl=BallPoseUdpCtrlCfg(), env=None)
 print(ctrl.get_data())   # valid=True, kick_ball_pos_b matching what you saw in step (a)
 "
 ```
 
 **d. Full run:**
 ```bash
-python scripts/run_pipeline_prepared.py -c g1_unified_loco_kick --live-ball --ball-source redis
+python scripts/run_pipeline_prepared.py -c g1_unified_loco_kick --live-ball --ball-source udp
 ```
 
 ---
 
 # 🩺 Troubleshooting
 
-- **`redis-cli get ball_pose_g1` returns nothing / `(nil)`** — the bridge isn't running, or your
-  detector isn't publishing yet, or Redis network/host mismatch (see step 4). Check layer (a) and
-  (b) above in order.
-- **`valid: False` from `BallPoseRedisCtrl.get_data()` despite Redis having a value** — the `t`
-  field is older than `stale_after_s` (0.5s default). Usually means your detector's publish rate is
-  too low, has stalled, or the bridge lost its subscription. Check `ros2 topic hz /ball_pose`.
+- **The raw UDP listener in step (b) never receives anything** — the bridge isn't running, your
+  detector isn't publishing yet, or a network/firewall/host mismatch is blocking the datagrams (see
+  step 4). Check layer (a) above first — if `ros2 topic echo` shows nothing either, the problem is
+  upstream of the bridge entirely.
+- **`valid: False` from `BallPoseUdpCtrl.get_data()` despite datagrams arriving** — the `t` field is
+  older than `stale_after_s` (0.5s default). Usually means your detector's publish rate is too low,
+  has stalled, or the bridge lost its subscription. Check `ros2 topic hz /ball_pose`.
 - **Robot walks toward the wrong spot** — almost always a frame/sign bug: either the y-axis sign is
   flipped (remember: **y = left**, so an object to the robot's right is **negative** y), or the
   heading-frame yaw projection wasn't applied and you're publishing in the raw sensor frame instead
