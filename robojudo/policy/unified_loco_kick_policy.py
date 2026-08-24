@@ -446,12 +446,23 @@ class UnifiedLocoKickPolicy(Policy):
         assert obs.shape[0] == 261, f"assembled obs is {obs.shape[0]}, expected 261"
         return obs
 
+    # Both transports implement the identical {"kick_ball_pos_b", "kick_target_pos_b", "valid"}
+    # contract (see ball_pose_redis_ctrl.py / ball_pose_ros2_ctrl.py) -- only one is ever wired into
+    # a given pipeline's controller list (run_pipeline_prepared.py's --ball-source), so at most one
+    # of these keys is present in ctrl_data at a time.
+    _LIVE_BALL_CTRL_TYPES = ("BallPoseRedisCtrl", "BallPoseRos2Ctrl")
+
     def _get_live_ball_obs(self, ctrl_data: dict) -> tuple[np.ndarray | None, np.ndarray | None]:
-        """Pull the latest kick_ball_pos_b/kick_target_pos_b from a BallPoseRedisCtrl if one is
-        wired into this pipeline's controller list (see run_pipeline_prepared.py's --live-ball
-        flag); (None, None) if no such controller is present, or its reading is stale/missing, so
-        _assemble_obs falls back to zero exactly as it always has for every other config."""
-        ball = ctrl_data.get("BallPoseRedisCtrl")
+        """Pull the latest kick_ball_pos_b/kick_target_pos_b from whichever live-ball controller
+        (Redis or ROS2) is wired into this pipeline's controller list (see run_pipeline_prepared.py's
+        --live-ball/--ball-source flags); (None, None) if none is present, or its reading is
+        stale/missing, so _assemble_obs falls back to zero exactly as it always has for every other
+        config."""
+        ball = None
+        for ctrl_type in self._LIVE_BALL_CTRL_TYPES:
+            ball = ctrl_data.get(ctrl_type)
+            if ball is not None:
+                break
         if ball is None or not ball.get("valid", False):
             return None, None
         return ball["kick_ball_pos_b"], ball["kick_target_pos_b"]

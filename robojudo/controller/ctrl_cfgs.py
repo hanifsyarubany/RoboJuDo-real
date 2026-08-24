@@ -178,3 +178,24 @@ class BallPoseRedisCtrlCfg(CtrlCfg):
 
     buffer_size: int = 5  # size of the data buffer to store recent readings
     stale_after_s: float = 0.5  # treat a reading older than this as "no detection" (falls back to zero)
+
+
+class BallPoseRos2CtrlCfg(CtrlCfg):
+    """ROS2 sibling of BallPoseRedisCtrlCfg -- same live kick_ball_pos_b/kick_target_pos_b contract,
+    carried over two topics instead of one Redis key. See ball_pose_ros2_ctrl.py for why it's two
+    topics (perception vs. a held aim command) and the QoS rationale."""
+
+    ctrl_type: str = "BallPoseRos2Ctrl"
+
+    node_name: str = "robojudo_ball_pose_ctrl"
+    ball_topic: str = "/ball_pose"  # geometry_msgs/PointStamped, robot heading frame (x-fwd, z-up)
+    aim_topic: str = "/kick_aim"  # geometry_msgs/Vector3Stamped, .x/.y used as kick_target_pos_b
+
+    # None -> inherit the process's ROS_DOMAIN_ID env var (rclpy's own default). Set explicitly only
+    # if this process must join a domain independent of its environment.
+    domain_id: int | None = None
+
+    qos_depth: int = 5  # matches BallPoseRedisCtrlCfg.buffer_size
+    qos_reliable: bool = False  # BEST_EFFORT by default -- see module docstring for why
+
+    stale_after_s: float = 0.5  # treat a ball reading older than this as "no detection" (falls back to zero)

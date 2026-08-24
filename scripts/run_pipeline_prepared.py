@@ -23,7 +23,7 @@ from redis.exceptions import RedisError
 import robojudo.pipeline
 from robojudo.config.config_manager import ConfigManager
 from robojudo.config.g1.env.g1_holosoma_env_cfg import HOLOSOMA_SCENE_WITH_BALL
-from robojudo.controller.ctrl_cfgs import BallPoseRedisCtrlCfg
+from robojudo.controller.ctrl_cfgs import BallPoseRedisCtrlCfg, BallPoseRos2CtrlCfg
 from robojudo.pipeline.pipeline_cfgs import RlPipelineCfg
 from robojudo.pipeline.rl_pipeline import RlPipeline
 
@@ -60,39 +60,87 @@ def parse_args():
         action="store_true",
         help=(
             "Feed the policy LIVE kick_ball_pos_b/kick_target_pos_b (instead of the hardcoded "
-            "zero) by adding a BallPoseRedisCtrl to the pipeline's controllers -- it polls Redis "
-            "for readings published by a separate perception process, in another terminal: "
-            "scripts/dummy_ball_perception.py for sim testing today, a real onboard detector "
-            "publishing to the same key/shape on the robot later (see --redis-host/--ball-redis-key). "
-            "In sim, also swaps in scene_g1_29dof_with_ball.xml (a physical ball to actually kick) "
-            "and PUBLISHES this process's own robot pose, plus the ball's TRUE current world "
-            "position (it moves when the robot's legs/feet push it -- reporting a fixed spawn point "
-            "would silently drift arbitrarily far from what's visible in the viewer), to "
-            "--robot-redis-key every tick. On real hardware there's no MuJoCo scene to swap and "
-            "nothing true to publish (a real camera-based detector reports relative to itself for "
-            "free, and has no ground truth either), so this only wires the controller."
+            "zero) by adding a live-ball controller to the pipeline's controllers -- see "
+            "--ball-source for which transport (Redis or ROS2) it uses to reach a separate "
+            "perception process running in another terminal: scripts/dummy_ball_perception.py for "
+            "sim testing today, a real onboard detector publishing to the same channel/shape on the "
+            "robot later. In sim, also swaps in scene_g1_29dof_with_ball.xml (a physical ball to "
+            "actually kick) and PUBLISHES this process's own robot pose, plus the ball's TRUE "
+            "current world position (it moves when the robot's legs/feet push it -- reporting a "
+            "fixed spawn point would silently drift arbitrarily far from what's visible in the "
+            "viewer), over Redis to --robot-redis-key every tick -- this sim-only relay always uses "
+            "Redis regardless of --ball-source, since it exists purely to let dummy_ball_perception.py "
+            "compute a robot-frame reading in sim and has no real-hardware counterpart at all (a real "
+            "camera-based detector reports relative to itself for free, with no ground truth to relay "
+            "either). On real hardware there's no MuJoCo scene to swap and nothing true to publish, "
+            "so --live-ball there only wires the controller chosen by --ball-source."
+        ),
+    )
+    parser.add_argument(
+        "--ball-source",
+        type=str,
+        choices=["redis", "ros2"],
+        default="redis",
+        help=(
+            "Only used with --live-ball. Transport for kick_ball_pos_b/kick_target_pos_b: "
+            "'redis' (default, unchanged) adds a BallPoseRedisCtrl -- see --redis-host/--ball-redis-key. "
+            "'ros2' adds a BallPoseRos2Ctrl subscribing to two topics instead (a live ball-position "
+            "topic plus a held aim-command topic) -- see --ball-topic/--aim-topic/--ros2-*. Point "
+            "scripts/dummy_ball_perception.py at the same transport with its own --transport flag."
         ),
     )
     parser.add_argument(
         "--redis-host",
         type=str,
         default=BallPoseRedisCtrlCfg().redis_host,
-        help="Only used with --live-ball. Redis host shared by both the ball-pose and robot-pose channels.",
+        help=(
+            "Used with --live-ball (always, for the sim-only robot-pose relay) and with "
+            "--ball-source redis (for the ball-pose channel itself)."
+        ),
     )
     parser.add_argument(
         "--ball-redis-key",
         type=str,
         default=BallPoseRedisCtrlCfg().redis_key,
-        help="Only used with --live-ball. Redis key the perception process publishes ball pose to.",
+        help="Only used with --live-ball --ball-source redis. Redis key the perception process publishes ball pose to.",
     )
     parser.add_argument(
         "--robot-redis-key",
         type=str,
         default="robot_pose_g1",
         help=(
-            "Only used with --live-ball in sim. Redis key this process publishes its own "
-            "base_pos_w/base_quat_xyzw to every tick, for the perception process to consume."
+            "Only used with --live-ball in sim (always over Redis, independent of --ball-source -- "
+            "see --live-ball's help). Redis key this process publishes its own base_pos_w/"
+            "base_quat_xyzw to every tick, for the perception process to consume."
         ),
+    )
+    parser.add_argument(
+        "--ball-topic",
+        type=str,
+        default=BallPoseRos2CtrlCfg().ball_topic,
+        help="Only used with --live-ball --ball-source ros2. geometry_msgs/PointStamped topic the "
+        "perception process publishes the live ball position to (robot heading frame, x-fwd/z-up).",
+    )
+    parser.add_argument(
+        "--aim-topic",
+        type=str,
+        default=BallPoseRos2CtrlCfg().aim_topic,
+        help="Only used with --live-ball --ball-source ros2. geometry_msgs/Vector3Stamped topic "
+        "carrying the held kick_target_pos_b/aim command (.x/.y used) -- see BallPoseRos2Ctrl's "
+        "module docstring for why this is a separate, non-expiring topic from --ball-topic.",
+    )
+    parser.add_argument(
+        "--ros2-node-name",
+        type=str,
+        default=BallPoseRos2CtrlCfg().node_name,
+        help="Only used with --live-ball --ball-source ros2. rclpy node name for this process's subscriber.",
+    )
+    parser.add_argument(
+        "--ros2-domain-id",
+        type=int,
+        default=None,
+        help="Only used with --live-ball --ball-source ros2. Overrides ROS_DOMAIN_ID for this "
+        "process; default (unset) inherits the environment variable, same as any other ROS2 node.",
     )
     args = parser.parse_args()
     return args
@@ -302,27 +350,52 @@ def main():
 
     robot_pose_redis_client = None
     if args.live_ball:
-        cfg.ctrl.append(BallPoseRedisCtrlCfg(redis_host=args.redis_host, redis_key=args.ball_redis_key))
+        if args.ball_source == "redis":
+            cfg.ctrl.append(BallPoseRedisCtrlCfg(redis_host=args.redis_host, redis_key=args.ball_redis_key))
+            ball_source_desc = f"redis key '{args.ball_redis_key}' on {args.redis_host}"
+            perception_cmd = (
+                f"python scripts/dummy_ball_perception.py --transport redis --redis-host {args.redis_host} "
+                f"--redis-key {args.ball_redis_key} --robot-redis-key {args.robot_redis_key}"
+            )
+        else:  # "ros2" -- see BallPoseRos2Ctrl's module docstring for the two-topic rationale
+            cfg.ctrl.append(
+                BallPoseRos2CtrlCfg(
+                    node_name=args.ros2_node_name,
+                    ball_topic=args.ball_topic,
+                    aim_topic=args.aim_topic,
+                    domain_id=args.ros2_domain_id,
+                )
+            )
+            ball_source_desc = f"ROS2 topics '{args.ball_topic}' (ball) / '{args.aim_topic}' (aim)"
+            perception_cmd = (
+                f"python scripts/dummy_ball_perception.py --transport ros2 --ball-topic {args.ball_topic} "
+                f"--aim-topic {args.aim_topic} --robot-redis-key {args.robot_redis_key}"
+            )
+
         if cfg.env.is_sim:
             cfg.env.xml = HOLOSOMA_SCENE_WITH_BALL
+            # The robot/true-ball pose relay below is a SIM-ONLY testing convenience (letting
+            # dummy_ball_perception.py compute a robot-frame reading without any real hardware) --
+            # it has no counterpart on real hardware regardless of --ball-source (a real detector is
+            # rigidly mounted and reports robot-frame for free), so it always uses Redis, independent
+            # of which transport carries the actual kick_ball_pos_b/kick_target_pos_b channel.
             robot_pose_redis_client = redis.Redis(host=args.redis_host, port=6379, db=0)
             logger.warning(
-                f"--live-ball: spawning a physical ball in the MuJoCo scene ({HOLOSOMA_SCENE_WITH_BALL}), "
-                f"reading kick_ball_pos_b/kick_target_pos_b live from redis key '{args.ball_redis_key}', "
-                f"and publishing this process's own robot pose PLUS the ball's true world position to "
-                f"'{args.robot_redis_key}' every tick (on {args.redis_host}). Start the perception "
-                f"stream in another terminal now if you haven't -- e.g. "
-                f"'python scripts/dummy_ball_perception.py --redis-host {args.redis_host} "
-                f"--redis-key {args.ball_redis_key} --robot-redis-key {args.robot_redis_key}' -- "
+                f"--live-ball (source={args.ball_source}): spawning a physical ball in the MuJoCo scene "
+                f"({HOLOSOMA_SCENE_WITH_BALL}), reading kick_ball_pos_b/kick_target_pos_b live from "
+                f"{ball_source_desc}, and publishing this process's own robot pose PLUS the ball's true "
+                f"world position to redis key '{args.robot_redis_key}' on {args.redis_host} every tick "
+                f"(this sim-only relay always uses Redis, regardless of --ball-source). Start the "
+                f"perception stream in another terminal now if you haven't -- e.g. '{perception_cmd}' -- "
                 f"pipeline construction below will block waiting for its first ball reading."
             )
         else:
             logger.warning(
-                f"--live-ball: no MuJoCo scene swap or robot-pose publish on real hardware (dynamics "
-                f"are the physical robot, and a real camera-based detector already reports relative "
-                f"to itself without needing this) -- reading kick_ball_pos_b/kick_target_pos_b live "
-                f"from redis key '{args.ball_redis_key}' on {args.redis_host}. Point your real "
-                f"perception process at the same key/shape (see scripts/dummy_ball_perception.py)."
+                f"--live-ball (source={args.ball_source}): no MuJoCo scene swap or robot-pose publish on "
+                f"real hardware (dynamics are the physical robot, and a real camera-based detector "
+                f"already reports relative to itself without needing this) -- reading "
+                f"kick_ball_pos_b/kick_target_pos_b live from {ball_source_desc}. Point your real "
+                f"perception process at the same channel/shape (see scripts/dummy_ball_perception.py)."
             )
 
     pipeline_type = cfg.pipeline_type

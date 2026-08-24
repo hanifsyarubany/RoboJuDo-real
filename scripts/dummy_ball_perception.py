@@ -1,8 +1,12 @@
 """Standalone dummy "perception" process for RoboJuDo's --live-ball flag (see
-run_pipeline_prepared.py and robojudo/controller/ball_pose_redis_ctrl.py).
+run_pipeline_prepared.py and robojudo/controller/ball_pose_redis_ctrl.py /
+robojudo/controller/ball_pose_ros2_ctrl.py).
 
 Run this in a SECOND terminal, alongside:
     python scripts/run_pipeline_prepared.py -c g1_unified_loco_kick --live-ball
+(add --ball-source ros2 on both sides to use ROS2 instead of Redis for the ball/aim channel --
+see TRANSPORT below. The robot/true-ball sim-state relay this script reads from is ALWAYS Redis,
+independent of --transport -- see --robot-redis-key.)
 
 WHAT THIS SIMULATES, AND WHAT IT DOESN'T:
 By default this TRACKS THE REAL SIMULATED BALL: run_pipeline_prepared.py publishes the physical
@@ -75,6 +79,21 @@ KICK_TARGET_POS_B: WORLD-FRAME OFFSET vs. AZIMUTH COMMAND (read this before depl
                                   set.
   --target-x/--target-y are ignored entirely in this mode -- there is no world-frame target point
   to compute a relative offset from (kick_aim_theta is a bearing OFFSET, not a point).
+
+TRANSPORT: --transport {redis, ros2}
+  'redis' (default, unchanged): SET the ball/aim reading as one JSON blob to --redis-key, matching
+  BallPoseRedisCtrl.
+
+  'ros2': publish kick_ball_pos_b as geometry_msgs/PointStamped on --ball-topic, and
+  kick_target_pos_b as geometry_msgs/Vector3Stamped (.x/.y used) on --aim-topic, matching
+  BallPoseRos2Ctrl -- see that module's docstring for why these are two separate topics (a
+  perception signal that must keep flowing vs. a held command that deliberately does not expire)
+  and its QoS default (BEST_EFFORT/VOLATILE, depth 5). Requires rclpy (ROS2) to be importable;
+  imported lazily so plain --transport redis runs never need it installed.
+
+  Either transport, --robot-redis-key is STILL READ OVER REDIS: it is a sim-only convenience (see
+  this module's own WHAT THIS SIMULATES section) with no real-hardware equivalent, so it never
+  needs to match whatever --transport the ball/aim channel itself uses.
 """
 
 from __future__ import annotations
@@ -114,14 +133,45 @@ _ARROW_STEP_M = 0.02  # meters moved per tick while an arrow key is held, in --i
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--redis-host", default="localhost")
+    ap.add_argument(
+        "--transport",
+        choices=["redis", "ros2"],
+        default="redis",
+        help="How to publish kick_ball_pos_b/kick_target_pos_b -- must match "
+        "run_pipeline_prepared.py's --ball-source on the other side. See this module's TRANSPORT "
+        "docstring section. The robot/true-ball sim-state relay below is unaffected -- always Redis.",
+    )
+    ap.add_argument("--redis-host", default="localhost", help="Used for BOTH transports: also serves the "
+        "sim-only robot/true-ball relay (--robot-redis-key) regardless of --transport.")
     ap.add_argument("--redis-port", type=int, default=6379)
     ap.add_argument("--redis-db", type=int, default=0)
-    ap.add_argument("--redis-key", default="ball_pose_g1", help="Must match BallPoseRedisCtrlCfg.redis_key.")
+    ap.add_argument(
+        "--redis-key", default="ball_pose_g1",
+        help="Only used with --transport redis. Must match BallPoseRedisCtrlCfg.redis_key.",
+    )
     ap.add_argument(
         "--robot-redis-key",
         default="robot_pose_g1",
-        help="Must match run_pipeline_prepared.py's --robot-redis-key. Robot (and true ball) pose read from here.",
+        help="Used with EITHER --transport (this relay is always Redis -- see the TRANSPORT "
+        "docstring section). Must match run_pipeline_prepared.py's --robot-redis-key. Robot (and "
+        "true ball) pose read from here.",
+    )
+    ap.add_argument(
+        "--ball-topic", default="/ball_pose",
+        help="Only used with --transport ros2. Must match BallPoseRos2CtrlCfg.ball_topic.",
+    )
+    ap.add_argument(
+        "--aim-topic", default="/kick_aim",
+        help="Only used with --transport ros2. Must match BallPoseRos2CtrlCfg.aim_topic.",
+    )
+    ap.add_argument(
+        "--ros2-node-name", default="dummy_ball_perception",
+        help="Only used with --transport ros2. rclpy node name for this process's publisher.",
+    )
+    ap.add_argument(
+        "--ros2-domain-id", type=int, default=None,
+        help="Only used with --transport ros2. Overrides ROS_DOMAIN_ID for this process; default "
+        "(unset) inherits the environment variable, same as any other ROS2 node.",
     )
     ap.add_argument("--rate", type=float, default=30.0, help="Publish rate, Hz.")
     ap.add_argument("--ball-x", type=float, default=DEFAULT_BALL_XYZ[0], help="Fallback ball world x (m) if no true ball.")
@@ -227,6 +277,65 @@ def _fetch_sim_state(client: redis.Redis, key: str) -> dict | None:
     }
 
 
+class _Ros2BallPublisher:
+    """--transport ros2 counterpart of the plain `client.set(args.redis_key, payload)` call in the
+    --transport redis path -- publishes the same two numbers (ball_pos_b, target_pos_b) as two
+    topics instead of one JSON blob. See BallPoseRos2Ctrl's module docstring for why it's two
+    topics and the QoS rationale (mirrored here so publisher and subscriber always agree)."""
+
+    def __init__(self, node_name: str, ball_topic: str, aim_topic: str, domain_id: int | None):
+        # Imported here, not at module scope, so `--transport redis` (the default) never needs
+        # ROS2 installed at all -- matches BallPoseRos2Ctrl's own lazy-import rationale.
+        import rclpy
+        from geometry_msgs.msg import PointStamped, Vector3Stamped
+        from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+
+        self._rclpy = rclpy
+        self._PointStamped = PointStamped
+        self._Vector3Stamped = Vector3Stamped
+
+        self._owns_rclpy_context = False
+        if not rclpy.ok():
+            init_kwargs = {} if domain_id is None else {"domain_id": domain_id}
+            rclpy.init(args=None, **init_kwargs)
+            self._owns_rclpy_context = True
+
+        self.node = rclpy.create_node(node_name)
+        # BEST_EFFORT/VOLATILE: matches BallPoseRos2Ctrl's default subscriber QoS exactly. A
+        # RELIABLE publisher would still connect fine to a BEST_EFFORT subscriber (QoS compatibility
+        # is about the subscriber not being STRICTER than the publisher), but there's no reason for
+        # this dummy publisher to ask for delivery guarantees the consumer doesn't need.
+        qos = QoSProfile(
+            depth=5,
+            history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self._ball_pub = self.node.create_publisher(PointStamped, ball_topic, qos)
+        self._aim_pub = self.node.create_publisher(Vector3Stamped, aim_topic, qos)
+
+    def publish(self, ball_pos_b: np.ndarray, target_pos_b: np.ndarray) -> None:
+        stamp = self.node.get_clock().now().to_msg()
+
+        ball_msg = self._PointStamped()
+        ball_msg.header.stamp = stamp
+        ball_msg.header.frame_id = "base_link"
+        ball_msg.point.x, ball_msg.point.y, ball_msg.point.z = (float(v) for v in ball_pos_b)
+        self._ball_pub.publish(ball_msg)
+
+        aim_msg = self._Vector3Stamped()
+        aim_msg.header.stamp = stamp
+        aim_msg.header.frame_id = "base_link"
+        aim_msg.vector.x, aim_msg.vector.y = float(target_pos_b[0]), float(target_pos_b[1])
+        aim_msg.vector.z = 0.0
+        self._aim_pub.publish(aim_msg)
+
+    def shutdown(self) -> None:
+        self.node.destroy_node()
+        if self._owns_rclpy_context and self._rclpy.ok():
+            self._rclpy.shutdown()
+
+
 def main() -> int:
     args = parse_args()
 
@@ -236,7 +345,23 @@ def main() -> int:
             "constraint as RoboJuDo's own KeyboardCtrl. Drop --interactive for a headless run."
         )
 
+    # ALWAYS connect to Redis, regardless of --transport: this client also drives the sim-only
+    # robot/true-ball relay (--robot-redis-key), which has no ROS2 counterpart -- see this module's
+    # TRANSPORT docstring section.
     client = connect_redis(args.redis_host, args.redis_port, args.redis_db)
+
+    ros2_pub = None
+    if args.transport == "ros2":
+        ros2_pub = _Ros2BallPublisher(
+            node_name=args.ros2_node_name,
+            ball_topic=args.ball_topic,
+            aim_topic=args.aim_topic,
+            domain_id=args.ros2_domain_id,
+        )
+        logger.info(
+            f"[transport=ros2] Publishing ball_pos_b -> '{args.ball_topic}' (PointStamped), "
+            f"target_pos_b -> '{args.aim_topic}' (Vector3Stamped) at {args.rate:.0f} Hz."
+        )
 
     arrows = _ArrowKeyOffset()
     if args.interactive:
@@ -343,18 +468,21 @@ def main() -> int:
                 ball_pos_b = ball_pos_b.copy()
                 ball_pos_b[:2] += rng.normal(0.0, args.jitter_std, size=2)
 
-            payload = json.dumps(
-                {
-                    "kick_ball_pos_b": ball_pos_b.tolist(),
-                    "kick_target_pos_b": target_pos_b.tolist(),
-                    "t": t_start,
-                }
-            )
-            try:
-                client.set(args.redis_key, payload)
-            except RedisError as e:
-                logger.warning(f"Lost redis connection ({e}), reconnecting...")
-                client = connect_redis(args.redis_host, args.redis_port, args.redis_db)
+            if args.transport == "ros2":
+                ros2_pub.publish(ball_pos_b, target_pos_b)
+            else:
+                payload = json.dumps(
+                    {
+                        "kick_ball_pos_b": ball_pos_b.tolist(),
+                        "kick_target_pos_b": target_pos_b.tolist(),
+                        "t": t_start,
+                    }
+                )
+                try:
+                    client.set(args.redis_key, payload)
+                except RedisError as e:
+                    logger.warning(f"Lost redis connection ({e}), reconnecting...")
+                    client = connect_redis(args.redis_host, args.redis_port, args.redis_db)
 
             tick += 1
             if tick % (int(args.rate) * 2) == 0:  # log roughly every 2s
@@ -365,6 +493,9 @@ def main() -> int:
                 time.sleep(period - elapsed)
     except KeyboardInterrupt:
         logger.info("Stopped.")
+    finally:
+        if ros2_pub is not None:
+            ros2_pub.shutdown()
     return 0
 
 
