@@ -65,6 +65,11 @@ class PolicyWrapper:
 class RlPipeline(Pipeline):
     cfg: RlPipelineCfg
 
+    ESTOP_SLOW_RAMP_SECONDS = 1.5  # [ESTOP_SLOW]: seconds for kp to fade to 0 (see MujocoEnv.estop())
+    SOFT_STOP_RAMP_SECONDS = 1.5  # [SOFT_STOP]: seconds for kp to fade to 0 -- works on sim AND real
+    GUARD_STOP_LEG_RAMP_SECONDS = 0.0  # [GUARD_STOP]: legs/waist -> 0 stiffness (instant by default)
+    GUARD_STOP_ARM_RAMP_SECONDS = 0.4  # [GUARD_STOP]: arms -> guard pose over this many seconds
+
     def __init__(self, cfg: RlPipelineCfg):
         super().__init__(cfg=cfg)
 
@@ -154,6 +159,65 @@ class RlPipeline(Pipeline):
                 case "[SHUTDOWN]":
                     logger.warning("Emergency shutdown!")
                     self.env.shutdown()
+                case "[ESTOP]" | "[ESTOP_SLOW]" | "[ESTOP_REAL]":
+                    # Sim-only: lets you OBSERVE what a torque cut looks like without closing the
+                    # viewer (unlike [SHUTDOWN], which just kills the window -- see estop()'s
+                    # docstring). hasattr-gated the same way [SIM_REBORN] below is: real envs
+                    # (UnitreeCppEnv) don't implement this, since [SHUTDOWN] already covers the
+                    # real E-stop path and blindly zeroing gains isn't something to bind on
+                    # hardware.
+                    #   [ESTOP]      = instant kp->0, kd unchanged (this checkpoint's trained kd)
+                    #   [ESTOP_SLOW] = kp ramps to 0 over ESTOP_SLOW_RAMP_SECONDS instead of
+                    #                  stepping there in one tick -- a gentler, "slow motion"
+                    #                  settle (see estop()'s docstring for why a ramp can look
+                    #                  LESS violent than an instant cut, not just slower)
+                    #   [ESTOP_REAL] = instant kp->0 with kd forced to ESTOP_REAL_DAMPING_KD (flat
+                    #                  5.0 for every joint) -- an exact sim replica of what real
+                    #                  hardware's UnitreeCppEnv.shutdown() actually does (verified
+                    #                  from unitree_cpp's own source, see MujocoEnv.estop()'s
+                    #                  docstring), which is itself instant/unramped
+                    if hasattr(self.env, "estop"):
+                        if command == "[ESTOP_SLOW]":
+                            self.env.estop(ramp_seconds=self.ESTOP_SLOW_RAMP_SECONDS)
+                        elif command == "[ESTOP_REAL]":
+                            self.env.estop(damping=self.env.ESTOP_REAL_DAMPING_KD)
+                        else:
+                            self.env.estop()
+                    else:
+                        logger.warning(
+                            f"{command} not supported on this env type -- use [SHUTDOWN] instead."
+                        )
+                case "[SOFT_STOP]":
+                    # DELIBERATE, non-emergency stop -- distinct from [SHUTDOWN] above, which stays
+                    # completely untouched by this and remains the fast/unconditional real E-stop.
+                    # Works on BOTH sim (MujocoEnv.soft_stop) and real (UnitreeCppEnv.soft_stop) with
+                    # the identical call signature, so the exact same binding can be rehearsed in
+                    # sim before ever trusting it on hardware. See either method's docstring for the
+                    # full rationale (in particular: real hardware's soft_stop() has NO recovery
+                    # path and a weaker liveness guarantee than [SHUTDOWN] -- never treat it as the
+                    # primary E-stop).
+                    if hasattr(self.env, "soft_stop"):
+                        self.env.soft_stop(ramp_seconds=self.SOFT_STOP_RAMP_SECONDS)
+                    else:
+                        logger.warning(
+                            "[SOFT_STOP] not supported on this env type -- use [SHUTDOWN] instead."
+                        )
+                case "[GUARD_STOP]":
+                    # DELIBERATE reflex: legs/waist cut to zero stiffness WHILE the arms actively
+                    # move to an overhead head-guard pose and hold it -- see
+                    # MujocoEnv.guard_stop()/UnitreeCppEnv.guard_stop()'s docstrings for the pose's
+                    # derivation and the (real, but reasoned-not-sourced) caveats. Distinct from
+                    # both [SHUTDOWN] (untouched, fast/unconditional) and [SOFT_STOP] (no arm
+                    # motion at all) -- works identically on sim and real like [SOFT_STOP] does.
+                    if hasattr(self.env, "guard_stop"):
+                        self.env.guard_stop(
+                            leg_ramp_seconds=self.GUARD_STOP_LEG_RAMP_SECONDS,
+                            arm_ramp_seconds=self.GUARD_STOP_ARM_RAMP_SECONDS,
+                        )
+                    else:
+                        logger.warning(
+                            "[GUARD_STOP] not supported on this env type -- use [SHUTDOWN] instead."
+                        )
                 case "[SIM_REBORN]":
                     if hasattr(self.env, "reborn"):
                         logger.warning("Simulation Env reborn!")

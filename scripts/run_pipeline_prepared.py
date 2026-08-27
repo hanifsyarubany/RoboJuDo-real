@@ -163,6 +163,35 @@ def parse_args():
         help="Only used with --live-ball --ball-source udp. Must match the sender's "
         "--udp-dest-port (foxy_ros2_ball_bridge.py or dummy_ball_perception.py --transport udp).",
     )
+    parser.add_argument(
+        "--ball-log-hz",
+        type=float,
+        default=1.0,
+        help="Only used with --live-ball. Rate (Hz) to log kick_ball_pos_b/kick_target_pos_b as "
+        "actually RECEIVED by this process's live-ball controller (not what the sender intended to "
+        "publish -- reflects real staleness/validity too). 0 disables this logging.",
+    )
+    parser.add_argument(
+        "--ball-log-decimals",
+        type=int,
+        default=5,
+        help="Only used with --ball-log-hz. Decimal places to print ball_pos_b/target_pos_b to. "
+        "Formatted as a fixed-precision string, not np.round()+tolist() -- the latter doesn't "
+        "actually shorten float32 values (e.g. -0.682 stored as float32 widens to Python's float64 "
+        "as -0.6819999814033508 regardless of rounding first; only string formatting truncates the "
+        "DISPLAY cleanly).",
+    )
+    parser.add_argument(
+        "--kick-aim-theta-ref-deg",
+        type=float,
+        default=45.0,
+        help="Only used with --live-ball, for the --ball-log-hz logging's DISPLAY-ONLY theta_if_aim "
+        "conversion (kick_target_pos_b[0] * this) -- does not affect the policy at all. Must match "
+        "the sender's own --kick-aim-theta-ref-deg (dummy_ball_perception.py) if you want the shown "
+        "degrees to be meaningful; this process has no way to know if the checkpoint actually uses "
+        "kick_aim_enabled, so the shown value is only correct when that's true. Default 45.0 matches "
+        "this project's own MultiSkillConfig/BallConfig.kick_aim_theta_ref_deg default.",
+    )
     args = parser.parse_args()
     return args
 
@@ -213,6 +242,45 @@ class BallRespawner:
         mujoco.mj_forward(self.env.model, self.env.data)
         self.env.update()
         logger.info(f"[live-ball] kick ended (skill {skill_id}) -- respawned ball at ({x:.2f}, {y:.2f}, {self.BALL_Z:.2f})")
+
+
+_BALL_CTRL_TYPE_BY_SOURCE = {"redis": "BallPoseRedisCtrl", "ros2": "BallPoseRos2Ctrl", "udp": "BallPoseUdpCtrl"}
+
+
+def _fmt_vec(values, decimals: int) -> str:
+    """Fixed-precision display of a float32 vector for logging. NOT np.round(values, decimals)
+    .tolist() -- that widens each already-imprecise float32 element to a Python float64, which
+    prints with the float32 value's full binary noise regardless of the rounding (e.g. a float32
+    holding -0.682 widens to -0.6819999814033508). Explicit string formatting truncates the DISPLAY
+    cleanly instead, independent of the underlying binary representation."""
+    return "[" + ", ".join(f"{float(v):.{decimals}f}" for v in values) + "]"
+
+
+def _peek_ball_reading(ctrl_inst, ctrl_type: str):
+    """Read-only snapshot of a live-ball controller's latest reading, for --ball-log-hz logging.
+    Deliberately does NOT call ctrl_inst.get_data() for the Redis/UDP controllers: their get_data()
+    pops from an internal deque, and this function is called independently of (and at a different
+    rate than) the pipeline's own per-tick get_data() call inside policy.get_observation() -- a
+    second, uncoordinated pop from the same deque would race with that real consumption and could
+    steal a reading meant for the policy. Instead reads their cached `last_data` snapshot (set by
+    whichever call -- ours or the pipeline's -- most recently popped), which is safe: pure
+    inspection, no side effects. BallPoseRos2Ctrl is different -- lock-protected fields overwritten
+    by ROS2 callbacks, get_data() is already a pure read -- so it's called directly there.
+
+    Returns None if nothing has ever arrived, else (ball_pos_b, target_pos_b, age_seconds_or_None,
+    valid). age is None for ros2 (that controller's get_data() doesn't expose the raw timestamp,
+    only the pre-computed valid bool)."""
+    if ctrl_type == "BallPoseRos2Ctrl":
+        data = ctrl_inst.get_data()
+        if data["kick_ball_pos_b"] is None:
+            return None
+        return data["kick_ball_pos_b"], data["kick_target_pos_b"], None, data["valid"]
+    last = ctrl_inst.last_data
+    if last is None:
+        return None
+    age = time.time() - last["t"]
+    valid = age <= ctrl_inst.stale_after_s
+    return last["kick_ball_pos_b"], last["kick_target_pos_b"], age, valid
 
 
 class DryRunSafetyMonitor:
@@ -439,6 +507,15 @@ def main():
 
     pipeline = pipeline_class(cfg=cfg)
 
+    ball_ctrl_inst = None
+    ball_ctrl_type = None
+    if args.live_ball and args.ball_log_hz > 0:
+        ball_ctrl_type = _BALL_CTRL_TYPE_BY_SOURCE[args.ball_source]
+        if ball_ctrl_type in pipeline.ctrl_manager.controllers:
+            ball_ctrl_inst = pipeline.ctrl_manager.controllers[ball_ctrl_type].inst
+        else:
+            logger.warning(f"[live-ball] expected controller {ball_ctrl_type!r} not found -- --ball-log-hz logging disabled.")
+
     if args.dry_run:
         logger.warning("=" * 78)
         logger.warning("DRY RUN: policy inference runs every tick, but NO torque will be applied.")
@@ -490,6 +567,7 @@ def main():
     )
 
     _robot_pose_publish_failing = False  # throttle: warn once per failure streak, not every tick
+    _last_ball_log_t = 0.0
 
     while True:
         time_start = time.time()
@@ -500,6 +578,24 @@ def main():
             # --dry-run applies no torque (env.step() skipped) -- teleporting the ball there would
             # still visibly move it despite "nothing physically moves" being the documented contract.
             ball_respawner.check_and_respawn()
+
+        if ball_ctrl_inst is not None and time_start - _last_ball_log_t >= (1.0 / args.ball_log_hz):
+            _last_ball_log_t = time_start
+            task_mode = pipeline.policy.policy.task_mode  # unwrap PolicyWrapper -> UnifiedLocoKickPolicy
+            reading = _peek_ball_reading(ball_ctrl_inst, ball_ctrl_type)
+            if reading is None:
+                logger.info(f"[live-ball] task_mode={task_mode} -- no reading received yet from {ball_ctrl_type}")
+            else:
+                ball_pos_b, target_pos_b, age, valid = reading
+                theta_deg = float(target_pos_b[0]) * args.kick_aim_theta_ref_deg
+                age_str = f"{age * 1000:.0f}ms" if age is not None else "n/a"
+                logger.info(
+                    f"[live-ball] task_mode={task_mode:<10} "
+                    f"ball_pos_b={_fmt_vec(ball_pos_b, args.ball_log_decimals)}  "
+                    f"target_pos_b={_fmt_vec(target_pos_b, args.ball_log_decimals)}  "
+                    f"theta_if_aim={theta_deg:+.1f}deg(ref={args.kick_aim_theta_ref_deg:.0f})  "
+                    f"age={age_str}  valid={valid}"
+                )
 
         if robot_pose_redis_client is not None:
             # The dummy/real perception process needs the robot's own pose to correctly compute how
