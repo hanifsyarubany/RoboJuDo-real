@@ -55,9 +55,29 @@ from robojudo.tools.tool_cfgs import DoFConfig
 #     "RoboNaldoBallKicking/20260814_021015-stageC-1skill-locoflip-shooting05-new-fixes-4-locomotion/model_0400000.onnx"
 # )
 
+# DEFAULT_ONNX_PATH = (
+#     "/workspaces/isaaclab_arena/submodules/workspaces/playground/unified_ball_kick_enhanced/logs/"
+#     "UnifiedBallKickingEnhanced/20260827_044728-stageB-skill011-h076-locomotion/model_0250000.onnx"
+# )
+
+# DEFAULT_ONNX_PATH = (
+#     "assets/motions/g1/football_play/"
+#     "stageB-skill011/model_0250000.onnx"
+# )
+
+# DEFAULT_ONNX_PATH = (
+#     "/workspaces/isaaclab_arena/submodules/workspaces/playground/unified_ball_kick_enhanced/logs/"
+#     "UnifiedBallKickingEnhanced/20260827_021301-stageB-skill012-h074-locomotion/model_0200000.onnx"
+# )
+
+# DEFAULT_ONNX_PATH = (
+#     "/workspaces/isaaclab_arena/submodules/workspaces/playground/unified_ball_kick_enhanced/logs/"
+#     "UnifiedBallKickingEnhanced/20260827_044801-stageB-skill012-h074-locomotion/model_0250000.onnx"
+# )
+
 DEFAULT_ONNX_PATH = (
     "/workspaces/isaaclab_arena/submodules/workspaces/playground/unified_ball_kick_enhanced/logs/"
-    "UnifiedBallKickingEnhanced/20260823_113321-stageB-skill011-h076-locomotion/model_0165000.onnx"
+    "UnifiedBallKickingEnhanced/20260902_071704-stageC-skill016-h074-locomotion/model_0340000.onnx"
 )
 
 class G1UnifiedLocoKickDoF(DoFConfig):
