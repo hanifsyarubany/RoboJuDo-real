@@ -53,6 +53,77 @@ skill is currently pending, instead of always skill 0. `[TRIGGER_KICK:N]` is una
 still an explicit override that also updates the pending selection to N, so a later plain
 `[TRIGGER_KICK]` repeats the same skill. This is the mechanism behind the deploy keyboard's "J
 cycles skill, K kicks" / joystick's equivalent combo (see g1_unified_loco_kick_cfg.py).
+
+Readiness gesture (opt-in, cfg `ready_gesture_enabled` + runtime `[TOGGLE_READY_GESTURE]` key):
+while the runtime master switch is ON and a live ball reading's (x, y) stays inside the CURRENTLY
+SELECTED skill's trained ball box -- `skill_ball_xy[sel]` +- `(randomize_x, randomize_y)`, the
+latter parsed per-skill from the ONNX's `experiment_config` -- the RIGHT arm swings CONTINUOUSLY,
+purely as an operator signal ("the ball is where this skill expects it, I'm lined up"). The runtime
+switch starts OFF; `[TOGGLE_READY_GESTURE]` (keyboard/joystick, see g1_unified_loco_kick_cfg.py)
+flips it, reset() clears it. Amplitude eases in when the ball enters the box and eases out when it
+leaves (or the switch is turned off); locomotion-only, standing-only by default; superimposes a
+small offset on the right-arm pd_target ONLY, never touching gains / `last_action` / balance / kick.
+See `_update_ready_gesture_state` / `_apply_ready_gesture`.
+
+Skill-cycled gesture (opt-in, cfg `skill_cycle_gesture_enabled`): a ONE-SHOT wave of the LEFT arm
+every time `[CYCLE_KICK_SKILL]` advances the pending skill selection -- a visual "the cycle press
+registered" acknowledgment, and a side cue distinct from the readiness gesture (right arm = ball in
+range, left arm = skill cycled). Plays `skill_cycle_gesture_duration_s` of a windowed sine (half-
+sine bump envelope x N full periods, so it starts AND ends at exactly zero) on the left
+shoulder/elbow pd_target, then stops; re-pressing cycle mid-wave restarts it. Locomotion-only,
+pd_target overlay only. No `--live-ball` needed; independent of `ready_gesture_enabled` (opposite
+arms). No-op on a single-skill checkpoint. See `_start_skill_cycle_gesture` / `_apply_skill_cycle_gesture`.
+
+Manual kick_aim_theta override (opt-in, cfg `manual_kick_aim_enabled`): `[KICK_AIM_THETA_INC]` /
+`[KICK_AIM_THETA_DEC]` (keyboard `.`/`,`, joystick LB+Right/LB+Left) nudge an operator-held
+`kick_aim_theta` (degrees) by `manual_kick_aim_step_deg` each press, `[KICK_AIM_THETA_RESET]`
+(keyboard `0`, joystick LB+Down) zeros it. While enabled, `kick_target_pos_b` is computed
+INTERNALLY every tick as `[kick_aim_theta / kick_aim_theta_ref_deg, 0.0]` -- exactly what
+`dummy_ball_perception.py --kick-aim-enabled --kick-aim-theta-deg` publishes, just driven from THIS
+process's own controller instead of a second one, and adjustable live instead of fixed for the run.
+Clamped to the CURRENTLY SELECTED skill's own trained `kick_aim_theta_max_deg`, parsed per-skill
+from the ONNX's `experiment_config` (falls back to the wider `kick_aim_theta_ref_deg` with a warning
+if that metadata is absent, or the selected skill wasn't trained `kick_aim_enabled`). Overrides
+`kick_target_pos_b` ONLY -- `kick_ball_pos_b` (the ball's own position) is untouched, still live if
+`--live-ball` is wired in, zero otherwise. SIGN: positive `kick_aim_theta` = the robot's own LEFT
+(holosoma's own atan2 convention -- `config_types/multi_skill.py`'s `resolved_nominal_bearing_deg`
+docstring: "0=+x/forward, positive=+y/the robot's own left" -- and `managers/observation/terms/
+unified.py`'s `kick_aim_command` passes `kick_aim_theta` straight through with no sign flip), so
+`[KICK_AIM_THETA_INC]` (positive delta) swings the kick LEFT, `[KICK_AIM_THETA_DEC]` swings it
+RIGHT -- g1_unified_loco_kick_cfg.py's key bindings are chosen so the KEY name matches this AIM
+direction, not the raw sign. See `_resolve_ball_and_target` / `_nudge_manual_kick_aim_theta`.
+
+Auto-navigation (opt-in, cfg `autonav_enabled` + runtime `[TOGGLE_AUTONAV]` key, starts OFF): while
+ON, `_update_velocity_command` computes its OWN (vx, vy, yaw_rate) instead of reading w/a/s/d/stick
+input -- a simple proportional loop closing the live `ball_pos_b` reading (`--live-ball`) onto the
+CURRENTLY SELECTED skill's own trained ball box center (same box `_selected_skill_ball_box()`
+already uses for the readiness gesture). It ONLY drives locomotion into range; it never triggers the
+kick itself (stays a manual `[TRIGGER_KICK]` by design). Commands ZERO (holds position) the instant
+`ball_pos_b` lands inside the box, so it can't oscillate past the goal chasing a shrinking residual.
+Two things cancel it outright, both same-tick: (1) ANY manual locomotion input -- a held w/a/s/d/q/e
+key or joystick deflection past `autonav_manual_deadzone` -- hands control straight back to the
+operator; (2) `ball_pos_b` going `None` (no `--live-ball`, stale reading, or the selected skill
+having no ball-box metadata) freezes at zero velocity and cancels rather than extrapolating blindly.
+Either cancellation clears the runtime switch -- resuming needs an explicit `[TOGGLE_AUTONAV]`
+press again, it never silently re-engages.
+
+Control law (signs UNFLIPPED, given this codebase's consistent positive=robot's-own-left convention
+-- see the SIGN note on manual kick_aim_theta above). Let `nav_error = ball_pos_b[:2] - box_center`
+and `gap` = the euclidean distance from the ball to the box BOUNDARY (0 once the ball is inside):
+  - closing speed `= min(kp_approach * gap, max_speed)`, applied along `unit(nav_error)` (aim for the
+    centre, not just the edge). Scaling by `gap` rather than `|nav_error|` is what keeps the robot
+    from blowing through the small box -- `kp*|nav_error|` keeps commanding ~kp*halfwidth right up
+    to the edge and the shared decel rate-limiter lags, so the robot arrives still carrying speed.
+  - `yaw_rate = kp_yaw * atan2(nav_error.y, max(ball_pos_b.x, 0.3))` with a ~4 deg deadband, but
+    ONLY while `gap > 0.15 m`. The ball's forward distance (not `nav_error.x`) is the denominator
+    because `nav_error.x` passes through zero at the standoff and `atan2` then blows up to
+    +-90..180 deg for a few-cm lateral error. Near the zone, yaw is dropped entirely -- a residual
+    turn there just rotates the ball's apparent position back out.
+Each term is clamped to that axis's `commands_map` max magnitude; while auto-nav drives, the shared
+rate-limiter's decel is sped up 3x (safe -- auto-nav works at low speed, unlike a full-speed manual
+walk). Locomotion-only (kick mode zeroes loco_command_lin_vel/ang_vel downstream anyway -- see
+`_assemble_obs`). Commands ZERO (holds) the instant the ball is inside the box. See
+`_compute_autonav_cmd`.
 """
 
 from __future__ import annotations
@@ -77,6 +148,21 @@ _TASK_KICK = "kick"
 @policy_registry.register
 class UnifiedLocoKickPolicy(Policy):
     cfg_policy: UnifiedLocoKickPolicyCfg
+
+    # Auto-nav conditioning (see _compute_autonav_cmd): forward-distance floor for the yaw atan2
+    # denominator so a ball beside/behind the robot can't produce a divide-by-tiny; a heading
+    # deadband so sub-degree lateral residuals don't make the heading hunt near the goal; and a
+    # minimum box-gap below which yaw is dropped entirely so vx/vy alone do the final positioning
+    # (a residual turn near the zone just drags the ball's apparent position out again). Structural
+    # conditioning, not tuning -- the operator-facing knobs are autonav_kp_approach/max_speed/kp_yaw.
+    _AUTONAV_YAW_FWD_FLOOR_M = 0.3
+    _AUTONAV_YAW_DEADBAND_RAD = float(np.deg2rad(4.0))
+    _AUTONAV_YAW_MIN_GAP_M = 0.15
+    # Auto-nav decelerates faster than the shared locomotion rate-limiter: it works at deliberately
+    # low speeds for precision, so an abrupt stop from ~0.3 m/s is safe (unlike halting a full-speed
+    # manual walk, which is what command_decel_time's slow ramp exists to cushion). Applied in
+    # _update_velocity_command only while auto-nav is driving.
+    _AUTONAV_DECEL_SPEEDUP = 3.0
 
     def __init__(self, cfg_policy: UnifiedLocoKickPolicyCfg, device):
         device = "cpu"
@@ -162,6 +248,104 @@ class UnifiedLocoKickPolicy(Policy):
             self._skill_ball_xy = []
             self._skill_target_xy = []
 
+        # ---- ready-gesture: per-skill ball box (skill_ball_xy +- (randomize_x, randomize_y)) ----
+        # randomize_x/randomize_y are NOT dedicated metadata keys -- they only live inside the big
+        # experiment_config JSON blob, per skill. Parse them here so the gesture can use the exact
+        # trained box for each skill; fall back to the config's (x, y) half-widths per skill if the
+        # blob is absent or shaped differently (older/other exports).
+        n_skills = len(self._skill_start_idx)
+        _hw_fallback = list(cfg_policy.ready_gesture_box_halfwidth_fallback_xy)
+        self._skill_ball_halfwidth_xy: list[list[float]] = [list(_hw_fallback) for _ in range(n_skills)]
+        if "experiment_config" in meta:
+            try:
+                import json
+
+                _ec = json.loads(meta["experiment_config"])
+                _sbc = _ec["command"]["setup_terms"]["motion_command"]["params"]["motion_config"]["skill_ball_configs"]
+                for _i in range(min(n_skills, len(_sbc))):
+                    _rx, _ry = _sbc[_i].get("randomize_x"), _sbc[_i].get("randomize_y")
+                    if _rx is not None:
+                        self._skill_ball_halfwidth_xy[_i][0] = float(_rx)
+                    if _ry is not None:
+                        self._skill_ball_halfwidth_xy[_i][1] = float(_ry)
+            except (KeyError, TypeError, ValueError, IndexError):
+                pass  # keep the per-skill fallback half-widths
+
+        # ---- manual kick_aim_theta override: theta_ref_deg (global) + per-skill theta_max_deg ----
+        # Same experiment_config source as the ready-gesture box above, different fields:
+        # kick_aim_theta_ref_deg is a single GLOBAL normalization constant (not per-skill);
+        # kick_aim_theta_max_deg is the actual TRAINED sampling range, global with an optional
+        # per-skill override (None = inherit the global value), and only meaningful for a skill
+        # whose own kick_aim_enabled is True. _skill_kick_aim_max_deg[i] is None for any skill that
+        # either wasn't trained with kick_aim_enabled, or whose max_deg couldn't be determined --
+        # _nudge_manual_kick_aim_theta falls back to +-theta_ref_deg (the widest safe bound) and
+        # warns when that happens, exactly mirroring dummy_ball_perception.py's own "getting this
+        # right is on the caller" caveat (no ONNX metadata says whether a skill is kick_aim-trained
+        # in a way that could be auto-verified beyond what's parsed here).
+        self._kick_aim_theta_ref_deg = 45.0  # this project's own stable default; overwritten below if present
+        self._skill_kick_aim_max_deg: list[float | None] = [None] * n_skills
+        if "experiment_config" in meta:
+            try:
+                import json
+
+                _ec2 = json.loads(meta["experiment_config"])
+                _mc = _ec2["command"]["setup_terms"]["motion_command"]["params"]["motion_config"]
+                self._kick_aim_theta_ref_deg = float(_mc.get("kick_aim_theta_ref_deg", self._kick_aim_theta_ref_deg))
+                _global_max_deg = _mc.get("kick_aim_theta_max_deg")
+                _sbc2 = _mc["skill_ball_configs"]
+                for _i in range(min(n_skills, len(_sbc2))):
+                    if bool(_sbc2[_i].get("kick_aim_enabled", False)):
+                        _per_skill_max = _sbc2[_i].get("kick_aim_theta_max_deg")
+                        _resolved = _per_skill_max if _per_skill_max is not None else _global_max_deg
+                        if _resolved is not None:
+                            self._skill_kick_aim_max_deg[_i] = float(_resolved)
+            except (KeyError, TypeError, ValueError, IndexError):
+                pass  # keep theta_ref_deg's project-default fallback; every skill stays max_deg=None
+
+        self._manual_kick_aim_enabled = bool(cfg_policy.manual_kick_aim_enabled)
+        self._manual_kick_aim_step_deg = float(cfg_policy.manual_kick_aim_step_deg)
+
+        self._ready_gesture_enabled = bool(cfg_policy.ready_gesture_enabled)
+        self._ready_gesture_ramp_s = float(cfg_policy.ready_gesture_ramp_s)
+        self._ready_gesture_shoulder_amp_rad = float(cfg_policy.ready_gesture_shoulder_amp_rad)
+        self._ready_gesture_elbow_amp_rad = float(cfg_policy.ready_gesture_elbow_amp_rad)
+        self._ready_gesture_freq_hz = float(cfg_policy.ready_gesture_freq_hz)
+        self._ready_gesture_only_when_standing = bool(cfg_policy.ready_gesture_only_when_standing)
+        try:
+            self._right_shoulder_pitch_idx = dof_names.index("right_shoulder_pitch_joint")
+            self._right_elbow_idx = dof_names.index("right_elbow_joint")
+        except ValueError:
+            self._right_shoulder_pitch_idx = self._right_elbow_idx = None
+            if self._ready_gesture_enabled:
+                logger.warning(
+                    "[UnifiedLocoKick] ready_gesture_enabled but right_shoulder_pitch_joint/"
+                    "right_elbow_joint are not in dof_names -- readiness gesture disabled."
+                )
+
+        # ---- one-shot "skill cycled" LEFT-arm wave (see _start/_apply_skill_cycle_gesture) ----
+        self._skill_cycle_gesture_enabled = bool(cfg_policy.skill_cycle_gesture_enabled)
+        self._skill_cycle_gesture_duration_s = float(cfg_policy.skill_cycle_gesture_duration_s)
+        self._skill_cycle_gesture_shoulder_amp_rad = float(cfg_policy.skill_cycle_gesture_shoulder_amp_rad)
+        self._skill_cycle_gesture_elbow_amp_rad = float(cfg_policy.skill_cycle_gesture_elbow_amp_rad)
+        self._skill_cycle_gesture_swings = float(cfg_policy.skill_cycle_gesture_swings)
+        try:
+            self._left_shoulder_pitch_idx = dof_names.index("left_shoulder_pitch_joint")
+            self._left_elbow_idx = dof_names.index("left_elbow_joint")
+        except ValueError:
+            self._left_shoulder_pitch_idx = self._left_elbow_idx = None
+            if self._skill_cycle_gesture_enabled:
+                logger.warning(
+                    "[UnifiedLocoKick] skill_cycle_gesture_enabled but left_shoulder_pitch_joint/"
+                    "left_elbow_joint are not in dof_names -- skill-cycled gesture disabled."
+                )
+
+        # ---- auto-navigation (see _compute_autonav_cmd) ----
+        self._autonav_enabled = bool(cfg_policy.autonav_enabled)
+        self._autonav_kp_approach = float(cfg_policy.autonav_kp_approach)
+        self._autonav_max_speed = float(cfg_policy.autonav_max_speed)
+        self._autonav_kp_yaw = float(cfg_policy.autonav_kp_yaw)
+        self._autonav_manual_deadzone = float(cfg_policy.autonav_manual_deadzone)
+
         # Default pose is NOT in the ONNX metadata (it lives in the training robot config), so it
         # must be supplied explicitly by the cfg. It is what dof_pos is measured relative to in the
         # observation (dof_pos - default), so a wrong default silently biases every dof_pos term.
@@ -198,6 +382,7 @@ class UnifiedLocoKickPolicy(Policy):
         # full experiment (including the disproven fast-decel hypothesis). The tiny snap band
         # just ensures the tail of the ramp cleanly crosses zero_cmd_eps into standing.
         axis_max_mag = np.array([np.abs(m).max() for m in self.commands_map])
+        self._cmd_max_mag = axis_max_mag  # [lin_x, lin_y, ang_z] max magnitude -- reused by autonav's clamp
         ramp_time = max(cfg_policy.command_ramp_time, 1e-6)
         decel_time = max(cfg_policy.command_decel_time, 1e-6)
         self._cmd_rate_limit_per_tick = (axis_max_mag / ramp_time) / self.freq  # accel, [lin_x, lin_y, ang_z]
@@ -239,6 +424,20 @@ class UnifiedLocoKickPolicy(Policy):
         self.robot_yaw_offset = 0.0
         self.motion_yaw_offset = 0.0
         self._prev_motion_command_t = None
+        # readiness-gesture state (see _update_ready_gesture_state / _apply_ready_gesture)
+        self._ready_gesture_user_on = False  # runtime master switch, flipped by [TOGGLE_READY_GESTURE]
+        self._ready_gesture_engaged = False  # condition currently holds (set every get_observation)
+        self._ready_gesture_level = 0.0  # 0..1 amplitude, ramps up while engaged / down while not
+        self._ready_gesture_phase = 0.0  # free-running sine phase (rad), reset to 0 once level hits 0
+        # one-shot "skill cycled" left-arm wave (see _start/_apply_skill_cycle_gesture)
+        self._skill_cycle_gesture_ticks_left = 0  # >0 while the wave is playing; counts down to 0
+        self._skill_cycle_gesture_total_ticks = 0  # window length captured when the wave was armed
+        # manual kick_aim_theta override (see _nudge/_reset_manual_kick_aim_theta); degrees, held
+        # across kicks/returns like _selected_skill_id (an operator dials this in ahead of a kick).
+        self._manual_kick_aim_theta_deg = 0.0
+        # auto-navigation runtime master switch (see _compute_autonav_cmd), flipped by
+        # [TOGGLE_AUTONAV] and auto-cleared by manual input or a lost ball reading. Starts OFF.
+        self._autonav_user_on = False
         # warm the ONNX once so a frame-0 clip value exists before the first real obs
         self._prime_clip()
 
@@ -272,9 +471,17 @@ class UnifiedLocoKickPolicy(Policy):
     # ------------------------------------------------------------------ #
     # commands from controller (locomotion velocity)                    #
     # ------------------------------------------------------------------ #
-    def _update_velocity_command(self, ctrl_data: dict):
+    def _update_velocity_command(self, ctrl_data: dict, ball_pos_b: np.ndarray | None):
         """Read velocity from JoystickCtrl/UnitreeCtrl axes or KeyboardCtrl w/a/s/d/q/e, remapped
         into the training command range. commands_map rows: [lin_x, lin_y, ang_z].
+
+        AUTO-NAV (see _compute_autonav_cmd's own docstring for the control law): if the runtime
+        switch (self._autonav_user_on) is on, `cmd` below is instead computed from the live
+        ball_pos_b reading -- UNLESS this tick's raw manual reading is nonzero, in which case that
+        manual input wins immediately and auto-nav is cancelled (self._autonav_user_on -> False)
+        right here, same tick. Manual input is checked from the RAW ctrl_data reading (before any
+        autonav substitution), never from the possibly-autonav-substituted `cmd` itself -- so
+        auto-nav's own commanded motion can never look like "manual input" and self-cancel.
 
         KeyboardCtrl.get_data() drains an event QUEUE each tick (pynput on_press/on_release
         callbacks) -- "keyboard_event" is only the press/release events that arrived since the
@@ -294,14 +501,16 @@ class UnifiedLocoKickPolicy(Policy):
         command ramps smoothly instead of stepping there in one 20ms tick, matching how holosoma's
         own (gradual, accumulator-based) keyboard scheme behaves -- side-by-side sim testing showed
         an instant step is survivable but visibly rougher than a gradual ramp."""
-        cmd = np.zeros(3)  # [lin_x(fwd), lin_y(lateral), ang_z(yaw)]
+        manual_cmd = np.zeros(3)  # [lin_x(fwd), lin_y(lateral), ang_z(yaw)]
+        manual_active = False
         for key in ctrl_data:
             if key in ("JoystickCtrl", "UnitreeCtrl"):
                 axes = ctrl_data[key]["axes"]
                 lx, ly, rx = axes["LeftX"], axes["LeftY"], axes["RightX"]
-                cmd[0] = command_remap(ly, self.commands_map[0])
-                cmd[1] = command_remap(lx, self.commands_map[1])
-                cmd[2] = command_remap(rx, self.commands_map[2])
+                manual_cmd[0] = command_remap(ly, self.commands_map[0])
+                manual_cmd[1] = command_remap(lx, self.commands_map[1])
+                manual_cmd[2] = command_remap(rx, self.commands_map[2])
+                manual_active = max(abs(lx), abs(ly), abs(rx)) > self._autonav_manual_deadzone
                 break
             if key == "KeyboardCtrl":
                 for event in ctrl_data[key]["keyboard_event"]:
@@ -312,23 +521,97 @@ class UnifiedLocoKickPolicy(Policy):
                 raw_fwd = float(held["w"]) - float(held["s"])
                 raw_lat = float(held["d"]) - float(held["a"])
                 raw_yaw = float(held["q"]) - float(held["e"])
-                cmd[0] = command_remap(raw_fwd, self.commands_map[0])
-                cmd[1] = command_remap(raw_lat, self.commands_map[1])
-                cmd[2] = command_remap(raw_yaw, self.commands_map[2])
+                manual_cmd[0] = command_remap(raw_fwd, self.commands_map[0])
+                manual_cmd[1] = command_remap(raw_lat, self.commands_map[1])
+                manual_cmd[2] = command_remap(raw_yaw, self.commands_map[2])
+                manual_active = any(held.values())
                 break
+
+        if manual_active and self._autonav_user_on:
+            self._autonav_user_on = False
+            logger.info("[UnifiedLocoKick] auto-nav CANCELLED -- manual locomotion input detected")
+
+        cmd = self._compute_autonav_cmd(ball_pos_b) if self._autonav_user_on else manual_cmd
 
         # Per-axis asymmetric rate limit: accelerating (|target| growing) uses the slow ramp,
         # decelerating uses the fast decel limit, and once the target is zero and the smoothed
         # value is inside the snap band, it snaps straight to zero -- see __init__'s comment for
         # why the slow-glide-to-zero was empirically destabilizing.
         accelerating = np.abs(cmd) > np.abs(self._smoothed_cmd)
-        limit = np.where(accelerating, self._cmd_rate_limit_per_tick, self._cmd_decel_limit_per_tick)
+        decel_limit = self._cmd_decel_limit_per_tick * (self._AUTONAV_DECEL_SPEEDUP if self._autonav_user_on else 1.0)
+        limit = np.where(accelerating, self._cmd_rate_limit_per_tick, decel_limit)
         delta = np.clip(cmd - self._smoothed_cmd, -limit, limit)
         self._smoothed_cmd = self._smoothed_cmd + delta
         snap = (cmd == 0.0) & (np.abs(self._smoothed_cmd) < self._cmd_zero_snap)
         self._smoothed_cmd = np.where(snap, 0.0, self._smoothed_cmd)
         self.lin_vel_command = self._smoothed_cmd[:2].copy()
         self.ang_vel_command = float(self._smoothed_cmd[2])
+
+    def _compute_autonav_cmd(self, ball_pos_b: np.ndarray | None) -> np.ndarray:
+        """[lin_x, lin_y, ang_z] target command that homes the robot onto the CURRENTLY SELECTED
+        skill's ball box (see this class's module docstring's Auto-navigation section for the full
+        control law and its cancellation rules). Called once per tick, ONLY while
+        self._autonav_user_on is True (see _update_velocity_command) -- a plain read/compute, this
+        method itself is what may flip that switch back off (stale ball / no box), mirroring how
+        _update_velocity_command's own manual-input check works.
+
+        Returns np.zeros(3) (hold position) whenever it can't or shouldn't drive: no live ball
+        reading, no per-skill box metadata, currently mid-kick, or already inside the box. All of
+        the first three ALSO cancel the runtime switch outright (same as a lost ball reading should
+        never leave a stale auto-nav silently armed); arriving inside the box does NOT cancel it --
+        it just holds at zero, ready to resume driving the instant the ball (or the selected skill,
+        which live-changes the target if cycled) moves it back out of range."""
+        if self.task_mode != _TASK_LOCOMOTION:
+            return np.zeros(3)
+        if ball_pos_b is None:
+            logger.warning("[UnifiedLocoKick] auto-nav CANCELLED -- ball_pos_b reading lost/stale")
+            self._autonav_user_on = False
+            return np.zeros(3)
+        box = self._selected_skill_ball_box()
+        if box is None:
+            logger.warning(
+                "[UnifiedLocoKick] auto-nav CANCELLED -- selected skill has no ball-box metadata "
+                "(no skill_ball_xy on this checkpoint, or the selected id is out of range)"
+            )
+            self._autonav_user_on = False
+            return np.zeros(3)
+        (x_lo, x_hi), (y_lo, y_hi) = box
+        ball_x, ball_y = float(ball_pos_b[0]), float(ball_pos_b[1])
+        if x_lo <= ball_x <= x_hi and y_lo <= ball_y <= y_hi:
+            return np.zeros(3)  # arrived -- hold, don't chase a shrinking residual to exactly zero
+
+        target_x, target_y = 0.5 * (x_lo + x_hi), 0.5 * (y_lo + y_hi)
+        nav_error = np.array([ball_x - target_x, ball_y - target_y])  # goal-center -> ball, in body frame
+        n = float(np.linalg.norm(nav_error))
+
+        # Closing SPEED is governed by how far OUTSIDE the box the ball still is (0 at the boundary),
+        # NOT by the distance to the box centre. A plain kp*nav_error keeps commanding ~kp*halfwidth
+        # right up to the edge, and with the shared decel rate-limiter the smoothed command lags --
+        # so the robot arrives carrying real speed and blows straight through the box. Scaling by
+        # the box GAP means the target speed is already ~0 by the time the ball reaches the zone.
+        gap_x = max(x_lo - ball_x, ball_x - x_hi, 0.0)
+        gap_y = max(y_lo - ball_y, ball_y - y_hi, 0.0)
+        gap = float(np.hypot(gap_x, gap_y))
+        speed = min(self._autonav_kp_approach * gap, self._autonav_max_speed)
+        direction = nav_error / n if n > 1e-6 else np.zeros(2)  # aim for the centre, not just the edge
+        vx, vy = speed * direction
+
+        # Yaw: only while there's real ground left to cover (gap above a threshold). Near the zone,
+        # a residual heading command just drags the ball's apparent position around (rotation
+        # effect) and helps it escape -- let vx/vy do the fine positioning. When it IS applied, the
+        # atan2 denominator is the ball's FORWARD distance (robustly positive while approaching), not
+        # nav_error.x, which blows up to +-90..180 deg for a few-cm lateral error the moment the
+        # robot reaches the standoff. Floor + deadband as before.
+        if gap > self._AUTONAV_YAW_MIN_GAP_M:
+            fwd_for_yaw = max(ball_x, self._AUTONAV_YAW_FWD_FLOOR_M)
+            bearing = float(np.arctan2(nav_error[1], fwd_for_yaw))
+            if abs(bearing) < self._AUTONAV_YAW_DEADBAND_RAD:
+                bearing = 0.0
+            yaw = self._autonav_kp_yaw * bearing
+        else:
+            yaw = 0.0
+
+        return np.clip(np.array([vx, vy, yaw]), -self._cmd_max_mag, self._cmd_max_mag)
 
     def _update_phase(self):
         """Advance gait phase; freeze both feet together when commanded velocity ~ 0 (standing).
@@ -467,10 +750,185 @@ class UnifiedLocoKickPolicy(Policy):
             return None, None
         return ball["kick_ball_pos_b"], ball["kick_target_pos_b"]
 
-    def get_observation(self, env_data, ctrl_data):
-        self._update_velocity_command(ctrl_data)
-        self._update_phase()
+    def _manual_kick_aim_target_pos_b(self) -> np.ndarray:
+        """The bounded aim command [kick_aim_theta_deg / kick_aim_theta_ref_deg, 0.0] for the
+        CURRENT operator-set self._manual_kick_aim_theta_deg -- exactly what dummy_ball_perception.py
+        --kick-aim-enabled publishes from its own fixed CLI value, computed here instead from a
+        value the controller can adjust live. See manual_kick_aim_enabled's cfg docstring."""
+        return np.array([self._manual_kick_aim_theta_deg / self._kick_aim_theta_ref_deg, 0.0], dtype=np.float32)
+
+    def _nudge_manual_kick_aim_theta(self, delta_deg: float):
+        """Adjust the operator-set manual kick_aim_theta by delta_deg, clamped to the CURRENTLY
+        SELECTED skill's own trained kick_aim_theta_max_deg (see __init__'s experiment_config
+        parsing). Falls back to +-kick_aim_theta_ref_deg (the widest value that still stays inside
+        the bounded obs slot) with a warning if this checkpoint has no such per-skill metadata, or
+        the selected skill wasn't trained with kick_aim_enabled at all -- same "verify this before
+        trusting it" caveat dummy_ball_perception.py's own docstring carries; nothing here can
+        confirm the selected skill actually wants a manual aim command. No-op (warned) if
+        manual_kick_aim_enabled is False in the cfg."""
+        if not self._manual_kick_aim_enabled:
+            logger.warning(
+                "[UnifiedLocoKick] kick_aim_theta nudge ignored -- manual_kick_aim_enabled is False "
+                "in the policy cfg (feature not active this run)."
+            )
+            return
+        sid = self._selected_skill_id
+        max_deg = self._skill_kick_aim_max_deg[sid] if 0 <= sid < len(self._skill_kick_aim_max_deg) else None
+        if max_deg is None:
+            max_deg = self._kick_aim_theta_ref_deg
+            logger.warning(
+                f"[UnifiedLocoKick] skill {sid} has no known kick_aim_theta_max_deg (not trained "
+                f"kick_aim_enabled, or this checkpoint lacks the metadata) -- clamping to the wider "
+                f"+-{max_deg:.1f} deg normalization reference instead of its real trained range; "
+                "verify this skill actually expects a manual aim command before trusting it."
+            )
+        self._manual_kick_aim_theta_deg = float(
+            np.clip(self._manual_kick_aim_theta_deg + delta_deg, -max_deg, max_deg)
+        )
+        logger.info(
+            f"[UnifiedLocoKick] manual kick_aim_theta -> {self._manual_kick_aim_theta_deg:+.1f} deg "
+            f"(skill {sid}, +-{max_deg:.1f} deg range)"
+        )
+
+    def _reset_manual_kick_aim_theta(self):
+        """Zero the operator-set manual kick_aim_theta ('aim along the calibrated nominal bearing',
+        matching dummy_ball_perception.py --kick-aim-theta-deg's own 0.0 default). No-op (warned) if
+        manual_kick_aim_enabled is False in the cfg."""
+        if not self._manual_kick_aim_enabled:
+            logger.warning(
+                "[UnifiedLocoKick] kick_aim_theta reset ignored -- manual_kick_aim_enabled is False "
+                "in the policy cfg (feature not active this run)."
+            )
+            return
+        self._manual_kick_aim_theta_deg = 0.0
+        logger.info("[UnifiedLocoKick] manual kick_aim_theta -> +0.0 deg (reset)")
+
+    def _resolve_ball_and_target(self, ctrl_data: dict) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """(kick_ball_pos_b, kick_target_pos_b) for this tick's observation: kick_ball_pos_b is
+        always whatever _get_live_ball_obs returns (untouched by the manual aim override -- it's a
+        different obs term, the ball's own position, not the aim command). kick_target_pos_b is
+        ALSO whatever _get_live_ball_obs returns UNLESS manual_kick_aim_enabled is on, in which case
+        it's replaced entirely by _manual_kick_aim_target_pos_b() -- the operator's own dialed-in
+        angle takes over from the ball-perception controller's aim reading (if any)."""
         ball_pos_b, target_pos_b = self._get_live_ball_obs(ctrl_data)
+        if self._manual_kick_aim_enabled:
+            target_pos_b = self._manual_kick_aim_target_pos_b()
+        return ball_pos_b, target_pos_b
+
+    def _selected_skill_ball_box(self) -> tuple[tuple[float, float], tuple[float, float]] | None:
+        """((x_lo, x_hi), (y_lo, y_hi)) of the CURRENTLY SELECTED skill's trained ball box --
+        skill_ball_xy[sel] +- self._skill_ball_halfwidth_xy[sel]. None if this checkpoint has no
+        per-skill ball geometry, or the selected id is out of range."""
+        sid = self._selected_skill_id
+        if not (0 <= sid < len(self._skill_ball_xy)) or not (0 <= sid < len(self._skill_ball_halfwidth_xy)):
+            return None
+        cx, cy = self._skill_ball_xy[sid]
+        hx, hy = self._skill_ball_halfwidth_xy[sid]
+        return ((cx - hx, cx + hx), (cy - hy, cy + hy))
+
+    def _update_ready_gesture_state(self, ball_pos_b: np.ndarray | None):
+        """Set self._ready_gesture_engaged: True while ALL of -- the runtime master switch is on
+        (_ready_gesture_user_on, flipped by [TOGGLE_READY_GESTURE]); the live ball reading is inside
+        the CURRENTLY SELECTED skill's trained box; task_mode is locomotion; and (if
+        _ready_gesture_only_when_standing) the commanded velocity is ~0. Called once per
+        get_observation. The actual arm motion -- a continuous swing that eases in/out with this
+        flag -- is applied in _apply_ready_gesture."""
+        if (
+            not self._ready_gesture_enabled
+            or not self._ready_gesture_user_on
+            or self._right_shoulder_pitch_idx is None
+        ):
+            self._ready_gesture_engaged = False
+            return
+        box = self._selected_skill_ball_box()
+        engaged = (
+            ball_pos_b is not None
+            and box is not None
+            and self.task_mode == _TASK_LOCOMOTION
+            and box[0][0] <= float(ball_pos_b[0]) <= box[0][1]
+            and box[1][0] <= float(ball_pos_b[1]) <= box[1][1]
+        )
+        if engaged and self._ready_gesture_only_when_standing:
+            standing = (
+                np.linalg.norm(self.lin_vel_command) < self.zero_cmd_eps
+                and abs(self.ang_vel_command) < self.zero_cmd_eps
+            )
+            engaged = engaged and standing
+
+        if engaged and not self._ready_gesture_engaged:
+            logger.info(
+                f"[UnifiedLocoKick] ball is in skill {self._selected_skill_id}'s trained range "
+                "-- right-arm readiness gesture (repeats while it stays in range)"
+            )
+        self._ready_gesture_engaged = engaged
+
+    def _apply_ready_gesture(self, scaled_action: np.ndarray) -> np.ndarray:
+        """Superimpose a CONTINUOUS right-arm swing on the already-scaled action (a pd_target
+        offset, in radians) while self._ready_gesture_engaged holds -- amplitude eases in over
+        _ready_gesture_ramp_s when engaged and eases out over the same time when not, so the swing
+        persists/repeats as long as the ball stays in range with no start/stop jerk. Pure output
+        overlay -- not stashed into self.last_action, so the policy never 'sees' or compensates for
+        it. task_mode leaving locomotion forces it off (eases out) immediately."""
+        engaged = self._ready_gesture_engaged and self.task_mode == _TASK_LOCOMOTION
+        step = 1.0 / max(self._ready_gesture_ramp_s * self.freq, 1.0)
+        self._ready_gesture_level = (
+            min(1.0, self._ready_gesture_level + step) if engaged else max(0.0, self._ready_gesture_level - step)
+        )
+        if self._ready_gesture_level <= 0.0:
+            self._ready_gesture_phase = 0.0  # next engagement restarts cleanly from a zero crossing
+            return scaled_action
+        self._ready_gesture_phase += 2.0 * np.pi * self._ready_gesture_freq_hz / self.freq
+        osc = self._ready_gesture_level * np.sin(self._ready_gesture_phase)
+        out = np.asarray(scaled_action, dtype=np.float64).copy()
+        out[self._right_shoulder_pitch_idx] += self._ready_gesture_shoulder_amp_rad * osc
+        out[self._right_elbow_idx] += self._ready_gesture_elbow_amp_rad * osc
+        return out
+
+    def _start_skill_cycle_gesture(self):
+        """Arm the ONE-SHOT left-arm wave that acknowledges a [CYCLE_KICK_SKILL] press (the actual
+        motion is applied in _apply_skill_cycle_gesture). No-op if the feature is disabled, the
+        left-arm joints aren't in dof_names, or a kick clip is currently running (the overlay is
+        locomotion-only, same rule as the readiness gesture). Re-arming while a wave is still
+        playing just restarts it from the top."""
+        if not self._skill_cycle_gesture_enabled or self._left_shoulder_pitch_idx is None:
+            return
+        if self.task_mode != _TASK_LOCOMOTION:
+            return
+        self._skill_cycle_gesture_total_ticks = max(1, int(round(self._skill_cycle_gesture_duration_s * self.freq)))
+        self._skill_cycle_gesture_ticks_left = self._skill_cycle_gesture_total_ticks
+
+    def _apply_skill_cycle_gesture(self, scaled_action: np.ndarray) -> np.ndarray:
+        """Superimpose the one-shot LEFT-arm 'skill cycled' wave on the already-scaled action -- a
+        pd_target offset (radians) active only for the skill_cycle_gesture_duration_s window after a
+        [CYCLE_KICK_SKILL]. Waveform: a half-sine bump envelope (0 -> 1 -> 0) times
+        skill_cycle_gesture_swings full sine periods, so it starts AND ends at exactly zero with no
+        jerk regardless of the swing count. Pure output overlay -- never stashed into
+        self.last_action, so the policy never sees or compensates for it. Drops the overlay
+        immediately if task_mode has left locomotion since the wave started (e.g. a kick fired
+        during it)."""
+        if self._skill_cycle_gesture_ticks_left <= 0 or self._left_shoulder_pitch_idx is None:
+            return scaled_action
+        if self.task_mode != _TASK_LOCOMOTION:
+            self._skill_cycle_gesture_ticks_left = 0
+            return scaled_action
+        total = max(self._skill_cycle_gesture_total_ticks, 1)
+        self._skill_cycle_gesture_ticks_left -= 1  # total-1 on the first tick ... 0 on the last
+        progress = 1.0 - self._skill_cycle_gesture_ticks_left / max(total - 1, 1)  # 0.0 -> 1.0 inclusive
+        envelope = np.sin(np.pi * progress)  # 0 -> 1 -> 0 across the window
+        osc = envelope * np.sin(2.0 * np.pi * self._skill_cycle_gesture_swings * progress)
+        out = np.asarray(scaled_action, dtype=np.float64).copy()
+        out[self._left_shoulder_pitch_idx] += self._skill_cycle_gesture_shoulder_amp_rad * osc
+        out[self._left_elbow_idx] += self._skill_cycle_gesture_elbow_amp_rad * osc
+        return out
+
+    def get_observation(self, env_data, ctrl_data):
+        # ball_pos_b resolved FIRST -- _update_velocity_command needs it for auto-nav (see its
+        # docstring); this reorder is a no-op for everything else, _resolve_ball_and_target is a
+        # pure read of ctrl_data/self._manual_kick_aim_theta_deg with no dependency on command state.
+        ball_pos_b, target_pos_b = self._resolve_ball_and_target(ctrl_data)
+        self._update_velocity_command(ctrl_data, ball_pos_b)
+        self._update_phase()
+        self._update_ready_gesture_state(ball_pos_b)
 
         dof_pos_rel = env_data.dof_pos - self.default_dof_pos
         dof_vel = env_data.dof_vel
@@ -513,7 +971,12 @@ class UnifiedLocoKickPolicy(Policy):
         self.motion_command_t = np.concatenate([np.asarray(outs[1]).squeeze(), np.asarray(outs[2]).squeeze()])
         self.ref_quat_xyzw_t = np.asarray(outs[3]).squeeze()
 
-        return actions * self.per_joint_action_scale
+        # arm overlays: readiness gesture (right arm) then skill-cycled wave (left arm) -- disjoint
+        # joints, pure pd_target offsets, neither stashed into self.last_action.
+        scaled = actions * self.per_joint_action_scale
+        scaled = self._apply_ready_gesture(scaled)
+        scaled = self._apply_skill_cycle_gesture(scaled)
+        return scaled
 
     # ------------------------------------------------------------------ #
     # commands / kick trigger                                            #
@@ -548,6 +1011,44 @@ class UnifiedLocoKickPolicy(Policy):
                 num_skills = len(self._skill_start_idx)
                 self._selected_skill_id = (self._selected_skill_id + 1) % num_skills
                 logger.info(f"[UnifiedLocoKick] pending kick skill -> {self._selected_skill_id}")
+                # one-shot left-arm "cycle registered" wave -- only when there's actually more than
+                # one skill to move between (a single-skill checkpoint's cycle is a no-op).
+                if num_skills > 1:
+                    self._start_skill_cycle_gesture()
+            elif command == "[TOGGLE_READY_GESTURE]":
+                # runtime master switch for the readiness gesture (see _update_ready_gesture_state).
+                # Only meaningful when ready_gesture_enabled is set in the cfg -- otherwise the
+                # feature is compiled out and this just warns. Persists until toggled again or the
+                # policy is reset().
+                if not self._ready_gesture_enabled:
+                    logger.warning(
+                        "[UnifiedLocoKick] [TOGGLE_READY_GESTURE] ignored -- ready_gesture_enabled "
+                        "is False in the policy cfg (feature not active this run)."
+                    )
+                else:
+                    self._ready_gesture_user_on = not self._ready_gesture_user_on
+                    logger.info(
+                        f"[UnifiedLocoKick] readiness gesture {'ON' if self._ready_gesture_user_on else 'OFF'} "
+                        "(swings only while the ball is in the selected skill's range)"
+                    )
+            elif command == "[KICK_AIM_THETA_INC]":
+                self._nudge_manual_kick_aim_theta(self._manual_kick_aim_step_deg)
+            elif command == "[KICK_AIM_THETA_DEC]":
+                self._nudge_manual_kick_aim_theta(-self._manual_kick_aim_step_deg)
+            elif command == "[KICK_AIM_THETA_RESET]":
+                self._reset_manual_kick_aim_theta()
+            elif command == "[TOGGLE_AUTONAV]":
+                # runtime master switch for auto-navigation (see _compute_autonav_cmd). Only
+                # meaningful when autonav_enabled is set in the cfg -- otherwise the feature is
+                # compiled out and this just warns, same pattern as [TOGGLE_READY_GESTURE].
+                if not self._autonav_enabled:
+                    logger.warning(
+                        "[UnifiedLocoKick] [TOGGLE_AUTONAV] ignored -- autonav_enabled is False in "
+                        "the policy cfg (feature not active this run)."
+                    )
+                else:
+                    self._autonav_user_on = not self._autonav_user_on
+                    logger.info(f"[UnifiedLocoKick] auto-nav {'ON' if self._autonav_user_on else 'OFF'}")
             elif command == "[RETURN_TO_LOCO]":
                 self._return_to_loco()
 

@@ -75,10 +75,28 @@ from robojudo.tools.tool_cfgs import DoFConfig
 #     "UnifiedBallKickingEnhanced/20260827_044801-stageB-skill012-h074-locomotion/model_0250000.onnx"
 # )
 
+# DEFAULT_ONNX_PATH = (
+#     "/workspaces/isaaclab_arena/submodules/workspaces/playground/unified_ball_kick_enhanced/logs/"
+#     "UnifiedBallKickingEnhanced/20260903_042200-distill-4skills-12161718-distill/model_0250000.onnx"
+# )
+
+# DEFAULT_ONNX_PATH = (
+#     "/workspaces/isaaclab_arena/submodules/workspaces/playground/unified_ball_kick_enhanced/logs/"
+#     "UnifiedBallKickingEnhanced/20260904_021435-stageC-skill012-h074-locomotion/model_0430000.onnx"
+# )
+
+# DEFAULT_ONNX_PATH = (
+#     "/workspaces/isaaclab_arena/submodules/workspaces/playground/unified_ball_kick_enhanced/logs/"
+#     "UnifiedBallKickingEnhanced/20260901_115721-stageC-skill012-h074-locomotion/model_0390000.onnx"
+# )
+
 DEFAULT_ONNX_PATH = (
     "/workspaces/isaaclab_arena/submodules/workspaces/playground/unified_ball_kick_enhanced/logs/"
-    "UnifiedBallKickingEnhanced/20260902_071704-stageC-skill016-h074-locomotion/model_0340000.onnx"
+    "UnifiedBallKickingEnhanced/20260904_021435-stageC-skill012-h074-locomotion/model_0490000.onnx"
 )
+
+
+
 
 class G1UnifiedLocoKickDoF(DoFConfig):
     # 29-DoF G1, exactly the ONNX dof_names order (== RoboJuDo G1 env order). Placeholder only:
@@ -116,3 +134,32 @@ class G1UnifiedLocoKickPolicyCfg(UnifiedLocoKickPolicyCfg):
 
     obs_dof: DoFConfig = G1UnifiedLocoKickDoF()
     action_dof: DoFConfig = G1UnifiedLocoKickDoF()
+
+    # Set True to have the right arm swing CONTINUOUSLY while the live ball reading (--live-ball)
+    # stays inside the currently-selected skill's trained ball box -- a "ball is where I expect it
+    # for this skill, ready to kick" signal for the operator (eases in on entering the box, eases
+    # out on leaving). No-op without --live-ball or on a checkpoint with no skill_ball_xy metadata.
+    # See UnifiedLocoKickPolicyCfg for the full knob set (ramp / amplitude / frequency /
+    # only-when-standing).
+    ready_gesture_enabled: bool = True
+
+    # Set True to have the LEFT arm do a single brief wave every time [CYCLE_KICK_SKILL] (keyboard
+    # j / joystick RB+X) advances the pending skill selection -- a one-shot "the cycle press
+    # registered" acknowledgment (and a side cue vs. the right-arm readiness gesture above). No
+    # --live-ball needed; no-op on a single-skill checkpoint. See UnifiedLocoKickPolicyCfg for the
+    # duration / amplitude / swing-count knobs.
+    skill_cycle_gesture_enabled: bool = True
+
+    # Set True to let keyboard `,`/`.`/`0` (joystick LB+Left/LB+Right/LB+Down) dial in kick_aim_theta
+    # live from THIS process's own controller -- no second dummy_ball_perception.py process or
+    # restart needed to try a different aim angle. Overrides kick_target_pos_b only; kick_ball_pos_b
+    # still comes from --live-ball (or zero) unaffected. See UnifiedLocoKickPolicyCfg for the
+    # step-size knob and the per-skill clamp/fallback behavior.
+    manual_kick_aim_enabled: bool = True
+
+    # Set True to let 'n' (joystick LB+Up) toggle auto-navigation: while ON, the policy drives its
+    # own (vx, vy, yaw_rate) to walk the robot into the currently-selected skill's trained ball box,
+    # holds once arrived, and leaves triggering the kick to the operator. Needs --live-ball; any
+    # manual stick/keyboard input instantly cancels it. See UnifiedLocoKickPolicyCfg for the gain
+    # knobs (autonav_kp_x/y/yaw) and UnifiedLocoKickPolicy's module docstring for the full design.
+    autonav_enabled: bool = True

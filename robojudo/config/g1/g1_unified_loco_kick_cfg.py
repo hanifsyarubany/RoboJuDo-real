@@ -42,11 +42,38 @@ CONTROLS
   Kick:
     keyboard : k = trigger kick, l = return to locomotion    joystick : RB+Up = kick, RB+Down = return
     keyboard : j = cycle kick skill (0,1,2,...,0)             joystick : RB+X = cycle kick skill
+    keyboard : b = toggle readiness gesture ON/OFF            joystick : RB+B = toggle readiness gesture
   (j / RB+X only changes WHICH skill the next k/RB+Up kicks -- it never kicks by itself, and
    can be pressed any time, including mid-kick, with no effect on the motion in progress. The
    selection persists across kicks/returns until changed again. If the checkpoint only has one
-   skill, cycling is a no-op.)
+   skill, cycling is a no-op. If skill_cycle_gesture_enabled is set in the policy cfg, each cycle
+   press also makes the LEFT arm do one short wave -- a "press registered" acknowledgment, only
+   while standing/walking, never mid-kick.)
+  (b / RB+B is a runtime ON/OFF toggle for the readiness gesture -- see PERCEPTION below. Starts
+   OFF; only does anything if ready_gesture_enabled is set in the policy cfg.)
   (the kick auto-returns to locomotion when the clip finishes; l / RB+Down is a manual override)
+  Aim:
+    keyboard : , / . = nudge kick aim LEFT/RIGHT 5 deg    joystick : LB+Left/LB+Right = aim L/R 5deg
+    keyboard : 0 = reset kick_aim_theta to 0 deg          joystick : LB+Down = reset kick_aim_theta
+  (only does anything if manual_kick_aim_enabled is set in the policy cfg -- see PERCEPTION below.
+   Each press is a discrete step, not a held ramp; release-triggered like every other keyboard key
+   here. Clamped to the SELECTED skill's own trained kick_aim_theta_max_deg; persists across
+   kicks/returns like the skill selection itself, so you can dial in an angle ahead of a kick.
+   kick_aim_theta itself is SIGNED opposite of these key names: positive theta = LEFT, per
+   holosoma's own atan2 convention (config_types/multi_skill.py's resolved_nominal_bearing_deg
+   docstring: "0=+x/forward, positive=+y/the robot's own left") -- ',' therefore sends
+   [KICK_AIM_THETA_INC] (+theta) and '.' sends [KICK_AIM_THETA_DEC] (-theta), so the KEY direction
+   matches the AIM direction even though the underlying sign is reversed. Don't "fix" this by
+   flipping INC/DEC's sign in the policy -- that sign matches training, this key<->command mapping
+   is what's deliberately inverted.)
+  Auto-nav:
+    keyboard : n = toggle auto-navigation ON/OFF          joystick : LB+Up = toggle auto-navigation
+  (only does anything if autonav_enabled is set in the policy cfg -- see PERCEPTION below. Starts
+   OFF. While ON, the policy drives its OWN vx/vy/yaw_rate toward the SELECTED skill's trained ball
+   box instead of reading w/a/s/d/stick -- it does NOT trigger the kick, that stays manual k/RB+Up.
+   ANY manual locomotion input (a held movement key, or stick past the deadzone) cancels it
+   IMMEDIATELY and hands control back -- 'n'/LB+Up again is needed to resume, it will not silently
+   re-engage. A lost/stale ball reading also cancels it, freezing at zero velocity that same tick.)
   Stop: keyboard Esc / joystick A (emergency stop -- UNMODIFIED, fast, unconditional, on both sim
         and real; see [SOFT_STOP] below for a deliberately gentler ALTERNATIVE, never a substitute).
     In SIM, Esc/A only closes the MuJoCo viewer -- it does NOT stop physics or the policy (see
@@ -109,6 +136,43 @@ PERCEPTION (optional)
   that script its own --kick-aim-enabled (plus --kick-aim-theta-deg/--kick-aim-theta-ref-deg) flag
   instead. See that script's module docstring for the full explanation; there is currently no ONNX
   metadata that would let this be auto-detected, so getting this right is on you, the caller.
+
+  READINESS GESTURE (opt-in): set G1UnifiedLocoKickPolicyCfg.ready_gesture_enabled = True (in
+  g1_unified_loco_kick_policy_cfg.py), then toggle it live with 'b' / RB+B (starts OFF). While ON,
+  the right arm swings CONTINUOUSLY whenever the live ball reading is inside the CURRENTLY SELECTED
+  skill's trained box (skill_ball_xy[sel] +- per-skill randomize_x/y from the ONNX) -- an operator
+  "I'm lined up for this skill" signal; it eases out and stops the moment you toggle it off or the
+  ball leaves the box. Needs --live-ball; no-op on a checkpoint without skill_ball_xy metadata.
+  Right-arm pd_target overlay only -- doesn't affect gains/balance/kick.
+
+  MANUAL KICK_AIM_THETA (opt-in): set G1UnifiedLocoKickPolicyCfg.manual_kick_aim_enabled = True,
+  then dial the angle with ,/. (or LB+Left/LB+Right) and reset with 0 (or LB+Down) -- see Aim under
+  CONTROLS above. While ON, kick_target_pos_b is computed from this operator-held angle INSTEAD of
+  whatever the ball-perception controller publishes -- the same [theta/theta_ref_deg, 0.0] command
+  dummy_ball_perception.py's own --kick-aim-enabled/--kick-aim-theta-deg sends, just adjustable live
+  in THIS process instead of fixed via a second process's CLI flag at launch. Does NOT need
+  --live-ball at all (kick_ball_pos_b is a separate, untouched obs term). Clamped to the SELECTED
+  skill's own trained kick_aim_theta_max_deg, read from the ONNX's experiment_config -- e.g. 15.0
+  deg for the 4-skill distilled checkpoint this config currently points at (NOT the 45.0 you'll see
+  everywhere as kick_aim_theta_ref_deg -- that's a fixed normalization constant, not a trained
+  range; see UnifiedLocoKickPolicy's module docstring for the full explanation).
+  SIGN: kick_aim_theta itself is positive=LEFT (holosoma's own atan2 convention -- see the CONTROLS/
+  Aim note above), which is why ','/LB+Left send [KICK_AIM_THETA_INC] (+theta) and '.'/LB+Right send
+  [KICK_AIM_THETA_DEC] (-theta): the KEY direction is made to match the AIM direction, even though
+  the underlying kick_aim_theta number moves opposite to the key's own left/right label.
+
+  AUTO-NAVIGATION (opt-in): set G1UnifiedLocoKickPolicyCfg.autonav_enabled = True, then toggle it
+  live with 'n' / LB+Up (starts OFF) -- see Auto-nav under CONTROLS above. While ON, the policy
+  computes its own locomotion command every tick -- a proportional loop (autonav_kp_x/y/yaw) driving
+  the live ball_pos_b reading onto the CURRENTLY SELECTED skill's trained ball box (the same box the
+  readiness gesture already checks), so it re-targets automatically if you cycle skill (j/RB+X)
+  mid-approach. Holds at zero the instant it arrives; it ONLY drives locomotion into range, it never
+  fires [TRIGGER_KICK] itself -- that stays entirely on the operator. Needs --live-ball; no-op on a
+  checkpoint without skill_ball_xy metadata for the selected skill. Two things cancel it, both
+  same-tick: any manual w/a/s/d/q/e press or stick deflection (hands control back immediately, no
+  need to press 'n' again first), or ball_pos_b going missing/stale (freezes at zero rather than
+  extrapolating). Either way resuming needs an explicit 'n'/LB+Up press -- it never silently
+  re-engages on its own. Velocity-command overlay only -- doesn't touch gains/kick/gestures.
 """
 
 import logging
@@ -130,7 +194,31 @@ CONTROLLER = "both"  # "both" | "keyboard" | "joystick"
 NET_IF = "eth0"  # robot network interface (only for DEPLOY_TARGET="real")
 # =============================================================================== #
 
-_KB_KICK_TRIGGERS = {"k": "[TRIGGER_KICK]", "l": "[RETURN_TO_LOCO]", "j": "[CYCLE_KICK_SKILL]"}
+_KB_KICK_TRIGGERS = {
+    "k": "[TRIGGER_KICK]",
+    "l": "[RETURN_TO_LOCO]",
+    # 'j' cycles which skill the next kick uses (0->1->...->0). If skill_cycle_gesture_enabled is
+    # set in the policy cfg, each press also triggers a one-shot LEFT-arm wave as a "registered"
+    # acknowledgment (locomotion-only, distinct from the right-arm readiness gesture on 'b').
+    "j": "[CYCLE_KICK_SKILL]",
+    # 'b' (ball-readiness) toggles the readiness gesture ON/OFF at runtime -- while ON, the right
+    # arm swings whenever the live ball is in the selected skill's trained box (no-op unless
+    # G1UnifiedLocoKickPolicyCfg.ready_gesture_enabled is set). Starts OFF; reset() clears it.
+    "b": "[TOGGLE_READY_GESTURE]",
+    # ','/'.'/0 nudge/reset the operator-set kick_aim_theta (manual_kick_aim_enabled -- see
+    # PERCEPTION below). Discrete per-press steps, not a held ramp -- release-triggered like every
+    # other keyboard key here. INC/DEC are DELIBERATELY swapped relative to their own sign here:
+    # kick_aim_theta is positive=LEFT (holosoma's atan2 convention, see this module's own docstring
+    # CONTROLS/Aim note), so ',' (left key) -> INC (+theta, aims left) and '.' (right key) -> DEC
+    # (-theta, aims right) -- this makes the KEY direction match the AIM direction for the operator,
+    # even though it means ',' increases the number and '.' decreases it.
+    ",": "[KICK_AIM_THETA_INC]",  # aim LEFT
+    ".": "[KICK_AIM_THETA_DEC]",  # aim RIGHT
+    "0": "[KICK_AIM_THETA_RESET]",
+    # 'n' toggles auto-navigation (autonav_enabled -- see PERCEPTION below). Starts OFF; any manual
+    # w/a/s/d/q/e press or stick deflection cancels it immediately without needing 'n' again.
+    "n": "[TOGGLE_AUTONAV]",
+}
 
 # [SOFT_STOP]/[GUARD_STOP]: DELIBERATE, non-emergency stops, distinct from [SHUTDOWN] (Esc/A) --
 # both implemented on BOTH MujocoEnv and UnitreeCppEnv (see their soft_stop()/guard_stop()
@@ -155,7 +243,21 @@ if DEPLOY_TARGET == "sim":
 # RB+Left/RB+Right are taken by g1_unified_loco_kick_amo's policy_switch_triggers (merged into this
 # same dict there -- see _make_ctrl) for AMO<->unified switching, so cycle-skill uses RB+X instead
 # to avoid a silent collision in that config. X is unbound elsewhere in this policy's controls.
-_JS_KICK_TRIGGERS = {"RB+Up": "[TRIGGER_KICK]", "RB+Down": "[RETURN_TO_LOCO]", "RB+X": "[CYCLE_KICK_SKILL]"}
+# RB+B is free in both configs (the _amo policy-switch combos are RB+Left/RB+Right only).
+_JS_KICK_TRIGGERS = {
+    "RB+Up": "[TRIGGER_KICK]",
+    "RB+Down": "[RETURN_TO_LOCO]",
+    "RB+X": "[CYCLE_KICK_SKILL]",
+    "RB+B": "[TOGGLE_READY_GESTURE]",  # toggle the readiness gesture ON/OFF -- see _KB_KICK_TRIGGERS
+    # LB (not RB) + D-pad -- kick_aim_theta nudge/reset, see _KB_KICK_TRIGGERS's ','/'.'/0. LB is
+    # otherwise completely unused by either config, so no collision with RB+Left/RB+Right
+    # (AMO<->unified policy switch, _amo config only) or anything above. INC/DEC swapped relative
+    # to their own sign for the same reason as ','/'.' -- see _KB_KICK_TRIGGERS's comment.
+    "LB+Left": "[KICK_AIM_THETA_INC]",  # aim LEFT
+    "LB+Right": "[KICK_AIM_THETA_DEC]",  # aim RIGHT
+    "LB+Down": "[KICK_AIM_THETA_RESET]",
+    "LB+Up": "[TOGGLE_AUTONAV]",  # LB's 4th D-pad direction -- see _KB_KICK_TRIGGERS's 'n'
+}
 
 # The real Unitree remote (UnitreeCtrl, via unitreeRemoteController.button_map) names its shoulder
 # buttons "L1"/"R1"; a generic gamepad (JoystickCtrl, via JoystickThread's Xbox-style button_map)

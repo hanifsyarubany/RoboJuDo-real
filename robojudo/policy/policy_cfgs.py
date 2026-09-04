@@ -493,3 +493,89 @@ class UnifiedLocoKickPolicyCfg(PolicyCfg):
     # keep it small so it doesn't recreate a discrete stop.
     command_decel_time: float = 1.0
     command_zero_snap: float = 0.02
+
+    # --- "ball is in the SELECTED skill's trained range" readiness gesture ---
+    # When ENABLED, and a live ball reading is available (--live-ball): while ball_pos_b's (x, y)
+    # stays inside the CURRENTLY SELECTED skill's trained ball box -- skill_ball_xy[sel] +-
+    # (randomize_x, randomize_y), read per-skill from the ONNX's experiment_config -- the right arm
+    # swings CONTINUOUSLY, purely as a "the ball is where I expect it for this skill, I'm lined up"
+    # signal for an operator. Only while in locomotion mode (never mid-kick) and -- if
+    # ready_gesture_only_when_standing -- only while the commanded velocity is ~0. The swing eases
+    # IN over ready_gesture_ramp_s when the ball enters the box and eases OUT over the same time
+    # when it leaves, so it persists/repeats with no start/stop jerk. It superimposes a small
+    # oscillation onto the right arm's pd_target ONLY; it does not change gains, gate the policy, or
+    # affect balance/kick/anything else. No-op unless the checkpoint has skill_ball_xy metadata.
+    ready_gesture_enabled: bool = False
+    ready_gesture_ramp_s: float = 0.4  # ease-in / ease-out time for the swing amplitude
+    ready_gesture_shoulder_amp_rad: float = 0.5  # right_shoulder_pitch swing amplitude
+    ready_gesture_elbow_amp_rad: float = 0.6  # right_elbow swing amplitude, in phase with the shoulder
+    ready_gesture_freq_hz: float = 1.2  # swings per second
+    ready_gesture_only_when_standing: bool = True
+    # per-skill box half-widths fall back to this (x, y) when the ONNX has no experiment_config to
+    # read per-skill randomize_x/randomize_y from (0.1/0.1 is this project's standard default).
+    ready_gesture_box_halfwidth_fallback_xy: list[float] = [0.1, 0.1]
+
+    # --- one-shot "skill cycled" LEFT-arm wave ---
+    # Every time [CYCLE_KICK_SKILL] (keyboard j / joystick RB+X) advances the pending skill
+    # selection, the LEFT arm does a single brief swing and returns to neutral -- a visual
+    # acknowledgment that the press registered (and a side cue: RIGHT arm = "ball is in range"
+    # readiness gesture, LEFT arm = "skill cycled"). ONE-SHOT, not continuous: it plays
+    # skill_cycle_gesture_duration_s of a windowed sine on the left shoulder/elbow pd_target and
+    # then stops on its own. Locomotion-only (never overlaid on a running kick clip); pressing
+    # cycle again while a wave is still playing restarts it from the top. Pure pd_target overlay --
+    # it does NOT touch gains / self.last_action / balance / the kick. Independent of --live-ball
+    # and of ready_gesture_enabled (they drive opposite arms and can both be on at once). No-op on
+    # a single-skill checkpoint (nothing to cycle).
+    skill_cycle_gesture_enabled: bool = False
+    skill_cycle_gesture_duration_s: float = 0.6  # total length of the one-shot wave
+    skill_cycle_gesture_shoulder_amp_rad: float = 0.55  # left_shoulder_pitch swing amplitude
+    skill_cycle_gesture_elbow_amp_rad: float = 0.45  # left_elbow swing amplitude, in phase
+    skill_cycle_gesture_swings: float = 1.0  # full sine periods within the window (1.0 = one there-and-back)
+
+    # --- manual kick_aim_theta override (operator dials aim from THIS process's own controller) ---
+    # When ENABLED, kick_target_pos_b is computed INTERNALLY every tick as [kick_aim_theta /
+    # kick_aim_theta_ref_deg, 0.0] from an operator-held angle the controller nudges -- instead of
+    # taking it from the live ball-perception controller (BallPoseRedisCtrl/Ros2Ctrl/UdpCtrl)'s own
+    # kick_target_pos_b reading, which is what happens when this is False (unchanged legacy
+    # behavior). kick_ball_pos_b (the ball's own position cue) is untouched either way -- still live
+    # if --live-ball is wired in, zero otherwise; this only ever overrides the AIM term. Mirrors
+    # dummy_ball_perception.py's --kick-aim-enabled/--kick-aim-theta-deg/--kick-aim-theta-ref-deg,
+    # just driven from THIS process's own keyboard/joystick instead of a second process, and
+    # adjustable LIVE instead of fixed for the whole run. kick_aim_theta_ref_deg itself is NOT a cfg
+    # field here -- it's read from the ONNX's own experiment_config (see __init__), same source of
+    # truth the checkpoint was actually trained against, falling back to this project's stable 45.0
+    # default only if that metadata is absent. No-op unless the loaded checkpoint's selected skill
+    # was trained with SkillConfig.kick_aim_enabled=True -- getting that right is still on the
+    # caller, same as the standalone script (nudging warns if it can't confirm this).
+    # SIGN: positive kick_aim_theta = the robot's own LEFT (holosoma's atan2 convention -- see
+    # UnifiedLocoKickPolicy's module docstring for the full source citation). The deploy keyboard/
+    # joystick bindings deliberately map their LEFT/RIGHT key names to the correspondingly-signed
+    # INC/DEC command, not to +/-, so a caller reading g1_unified_loco_kick_cfg.py's trigger dicts
+    # directly should not assume INC means "more positive" reads as "more right."
+    manual_kick_aim_enabled: bool = False
+    manual_kick_aim_step_deg: float = 5.0  # degrees nudged per [KICK_AIM_THETA_INC]/[_DEC] press
+
+    # --- auto-navigation: drive locomotion (vx, vy, yaw_rate) toward the kicking zone ---
+    # When ENABLED and toggled on at runtime ([TOGGLE_AUTONAV], starts OFF), _update_velocity_command
+    # computes its OWN velocity command every locomotion tick instead of reading w/a/s/d/stick input
+    # -- a simple proportional loop closing the live ball_pos_b reading (--live-ball) onto the
+    # CURRENTLY SELECTED skill's own trained ball box (the SAME box _selected_skill_ball_box()
+    # already computes for the readiness gesture -- no new geometry, reuses that parsed metadata).
+    # Commands ZERO (holds position) the instant ball_pos_b lands inside the box; it never triggers
+    # the kick itself, that stays a manual [TRIGGER_KICK] -- see UnifiedLocoKickPolicy's module
+    # docstring for the full control law and its two cancellation rules (manual input always wins;
+    # a lost/stale ball reading freezes and cancels rather than extrapolating). Needs --live-ball;
+    # no-op on a checkpoint without skill_ball_xy metadata for the selected skill.
+    autonav_enabled: bool = False
+    # Closing speed = min(autonav_kp_approach * gap, autonav_max_speed), where `gap` is the distance
+    # from the ball to the box BOUNDARY (0 at the edge) -- NOT the distance to the box centre. This
+    # is what stops the robot blowing through the small box: the commanded speed is already ~0 by
+    # the time the ball reaches the zone. Lower kp_approach / max_speed for a gentler, slower
+    # approach; raise them to close distance faster (at the cost of more overshoot risk).
+    autonav_kp_approach: float = 1.5  # 1/s -- speed per metre of box gap
+    autonav_max_speed: float = 0.35  # m/s -- cruise cap while still far from the box
+    autonav_kp_yaw: float = 2.0  # yaw-rate gain (1/s); dropped entirely once within 0.15 m of the box
+    # joystick stick-axis magnitude (LeftX/LeftY/RightX) below which input does NOT count as
+    # "manual override" -- avoids false-cancelling auto-nav from stick center-noise/drift. Keyboard
+    # has no equivalent (w/a/s/d/q/e are discrete press/release, never noisy).
+    autonav_manual_deadzone: float = 0.05

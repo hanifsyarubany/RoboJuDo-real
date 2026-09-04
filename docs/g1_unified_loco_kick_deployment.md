@@ -164,9 +164,17 @@ Works identically in sim and real (when `CONTROLLER` includes `"keyboard"`).
 | `a` / `d` | strafe left / right |
 | `q` / `e` | turn left / right |
 | `k` | trigger kick (kicks whichever skill is currently selected, see `j` below) |
-| `j` | cycle which kick skill `k` will trigger next (0 → 1 → ... → N-1 → 0). Doesn't kick, doesn't interrupt a kick in progress — only changes what the *next* `k` does. No-op on a single-skill checkpoint. |
+| `j` | cycle which kick skill `k` will trigger next (0 → 1 → ... → N-1 → 0). Doesn't kick, doesn't interrupt a kick in progress — only changes what the *next* `k` does. No-op on a single-skill checkpoint. If `skill_cycle_gesture_enabled` is set, each press also fires a one-shot LEFT-arm wave (~0.6s, plays once, then stops) as a "press registered" acknowledgment — locomotion-only. |
+| `b` | toggle the readiness gesture ON/OFF (starts OFF). While ON, the RIGHT arm swings continuously whenever the live `--live-ball` reading is inside the currently-selected skill's trained box. No-op unless `G1UnifiedLocoKickPolicyCfg.ready_gesture_enabled` is set. |
+| `,` / `.` | aim the kick LEFT / RIGHT by `manual_kick_aim_step_deg` (default 5°), clamped to the selected skill's own trained range. No-op unless `manual_kick_aim_enabled` is set. (`kick_aim_theta` itself is signed positive=left, so under the hood `,`→`+theta`, `.`→`-theta` — the key names track the aim direction, not the raw sign.) |
+| `0` | reset `kick_aim_theta` to 0° (aim along the skill's calibrated nominal bearing). Same gating as `,`/`.`. |
+| `n` | toggle auto-navigation ON/OFF (starts OFF). While ON, the policy drives its own vx/vy/yaw_rate to walk into the selected skill's ball box, holds once arrived, and never triggers the kick itself. No-op unless `autonav_enabled` is set; needs `--live-ball`. Any manual movement key press cancels it immediately (no need to press `n` again first) — see [Auto-navigation](#-auto-navigation) below. |
 | `l` | return to locomotion (manual override — the kick also auto-returns once the clip finishes) |
 | `Esc` | emergency stop (`[SHUTDOWN]`) |
+
+> This table is not exhaustively synced — the authoritative control list is the `CONTROLS` section
+> of `robojudo/config/g1/g1_unified_loco_kick_cfg.py`'s module docstring (also lists `i`/`g` soft &
+> guard stop, and the sim-only `p`/`o`/`r`/`` ` `` observation keys).
 
 **With `--live-ball` in sim**: the physical ball is automatically teleported back to the just-kicked
 skill's own nominal spawn position (zero velocity) the instant a kick ends (auto-return or `l`) — so
@@ -229,7 +237,11 @@ Layout reference (RB = right shoulder button, above RT; LB = left shoulder, abov
 |---|---|
 | RB + D-pad Up | trigger kick (kicks whichever skill is currently selected, see RB + X below) |
 | RB + D-pad Down | return to locomotion (manual override) |
-| RB + X | cycle which kick skill the trigger will kick next (0 → 1 → ... → N-1 → 0). Doesn't kick, safe to press mid-kick. No-op on a single-skill checkpoint. |
+| RB + X | cycle which kick skill the trigger will kick next (0 → 1 → ... → N-1 → 0). Doesn't kick, safe to press mid-kick. No-op on a single-skill checkpoint. Same one-shot LEFT-arm wave as keyboard `j`, see above. |
+| RB + B | toggle the readiness gesture ON/OFF (same as keyboard `b`, see the keyboard table above) |
+| LB + D-pad Left / Right | aim the kick LEFT / RIGHT (same as keyboard `,`/`.` — see the sign note above) |
+| LB + D-pad Down | reset `kick_aim_theta` to 0° (same as keyboard `0`) |
+| LB + D-pad Up | toggle auto-navigation ON/OFF (same as keyboard `n`) |
 
 **Other:**
 
@@ -246,6 +258,50 @@ Layout reference (RB = right shoulder button, above RT; LB = left shoulder, abov
 
 Like the keyboard, stick deflection is rate-limited into the commanded velocity (~0.5s to reach max
 magnitude) rather than applied instantly.
+
+---
+
+# 🧭 Auto-navigation
+
+Set `G1UnifiedLocoKickPolicyCfg.autonav_enabled = True`, then toggle it live with `n` / LB+Up (starts
+OFF). While ON, the policy computes its own locomotion command every tick instead of reading
+w/a/s/d/stick input, driving the live `ball_pos_b` reading (`--live-ball`) onto the **currently
+selected** skill's trained ball box (the exact same box the readiness gesture already checks) — so
+cycling skill (`j`/RB+X) mid-approach re-targets it live, automatically. It holds at zero the instant
+it arrives and **never triggers the kick itself** — that's always a manual `k`/RB+Up, by design.
+
+Two things cancel it, both same tick:
+- **Any manual locomotion input** — a held movement key, or stick deflection past
+  `autonav_manual_deadzone` — hands control back immediately, no need to press `n` again first.
+- **A lost or stale ball reading** freezes at zero velocity and cancels, rather than extrapolating
+  blindly.
+
+Either way, resuming needs an explicit `n`/LB+Up press again — it never silently re-engages.
+
+Needs `--live-ball`; no-op on a checkpoint without `skill_ball_xy` metadata for the selected skill.
+
+**Control law:**
+- **Closing speed** = `min(autonav_kp_approach · gap, autonav_max_speed)` along the unit vector
+  toward the box centre, where `gap` is the distance from the ball to the box **boundary** (not the
+  centre). Scaling by the *gap* is what stops the robot blowing through the small box — the
+  commanded speed is already ~0 by the time the ball reaches the zone. `autonav_max_speed` (default
+  0.35 m/s) is the cruise cap while still far.
+- **Yaw** = `autonav_kp_yaw · atan2(nav_error.y, max(ball_pos_b.x, 0.3))` with a ~4° deadband,
+  **only while more than 0.15 m outside the box**. The denominator is the ball's forward distance
+  (not `nav_error.x`, which passes through zero at the standoff and makes `atan2` blow up to
+  ±90–180° for a few-cm lateral error). Near the zone, yaw is dropped entirely — a residual turn
+  there just rotates the ball's apparent position back out.
+- While auto-nav drives, the shared rate-limiter's deceleration is sped up 3× (safe — auto-nav
+  works at low speed, unlike halting a full-speed manual walk).
+
+**Verified**, real MuJoCo physics + the real trained ONNX (not a mock):
+- Sign conventions empirically confirmed, not just derived: `ang_vel = +0.8` → `+37.75°` of actual
+  yaw over 80 ticks, `−0.8` → `−34.44°` (positive = turn-left).
+- Overshoot/escape (the reason for the gap-scaling): approaches from mild-left, 2 m straight, 2 m
+  diagonal, and hard-right all converge and **stay** in the box — `0` ticks outside the box over a
+  16 s hold-and-watch window each, final speed `0.000`, no falls. The earlier `kp·|nav_error|` law
+  arrived carrying real speed and walked the ball straight through the far side.
+- Tune `autonav_kp_approach` / `autonav_max_speed` down for a gentler approach if needed.
 
 ---
 
