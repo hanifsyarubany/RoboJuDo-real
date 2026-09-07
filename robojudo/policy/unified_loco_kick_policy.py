@@ -122,8 +122,18 @@ and `gap` = the euclidean distance from the ball to the box BOUNDARY (0 once the
 Each term is clamped to that axis's `commands_map` max magnitude; while auto-nav drives, the shared
 rate-limiter's decel is sped up 3x (safe -- auto-nav works at low speed, unlike a full-speed manual
 walk). Locomotion-only (kick mode zeroes loco_command_lin_vel/ang_vel downstream anyway -- see
-`_assemble_obs`). Commands ZERO (holds) the instant the ball is inside the box. See
-`_compute_autonav_cmd`.
+`_assemble_obs`). Commands ZERO (holds) the instant the ball is inside the box.
+
+Once outside the box, whether to react at all is gated on a LOW-PASS FILTERED gap
+(`_autonav_gap_ema`, time constant `_AUTONAV_GAP_EMA_TAU_S`), not the raw one -- a persistence gate,
+not an amplitude gate. Measured need for this: even with zero autonav input, this policy's own
+"stand still" behavior drifts the ball ~0.1 m over 20-30 s (a real, inherent property of the
+checkpoint, not a bug), and a plain small deadband can't both ignore that everyday settling/sway AND
+still eventually correct a slow drift before it walks the ball out of the (tighter) readiness-gesture
+box for good -- a several-tick blip barely moves the filtered value, but a multi-second drift reaches
+it within about one time constant, same as the raw signal would. Reset to 0 every time the ball is
+confirmed back inside the box, so a stale filtered value from a past excursion never biases the next
+one. See `_compute_autonav_cmd`.
 """
 
 from __future__ import annotations
@@ -163,6 +173,16 @@ class UnifiedLocoKickPolicy(Policy):
     # manual walk, which is what command_decel_time's slow ramp exists to cushion). Applied in
     # _update_velocity_command only while auto-nav is driving.
     _AUTONAV_DECEL_SPEEDUP = 3.0
+    # Below this LOW-PASS FILTERED (not raw) box-gap, treat the ball as arrived -- see
+    # _compute_autonav_cmd's own comment for why persistence (the filter), not just a bigger flat
+    # threshold, is what's needed here: a brief settling/sway blip must be ignored regardless of its
+    # size, while a slow multi-second drift must still get corrected even though it's small tick to
+    # tick. Swept both (deadband, tau) against a real post-approach settle AND a 40 s standing-drift
+    # trace (real MuJoCo physics): 1.0 cm / 0.4 s was the best point found -- corrections stayed
+    # gentle (|ang_vel| <= 0.16, nowhere near the pre-fix 0.8 spikes) while still reliably
+    # re-engaging the readiness gesture after each drift-out, in both scenarios' final windows.
+    _AUTONAV_GAP_DEADBAND_M = 0.010
+    _AUTONAV_GAP_EMA_TAU_S = 0.4
 
     def __init__(self, cfg_policy: UnifiedLocoKickPolicyCfg, device):
         device = "cpu"
@@ -438,6 +458,9 @@ class UnifiedLocoKickPolicy(Policy):
         # auto-navigation runtime master switch (see _compute_autonav_cmd), flipped by
         # [TOGGLE_AUTONAV] and auto-cleared by manual input or a lost ball reading. Starts OFF.
         self._autonav_user_on = False
+        # low-pass filtered box-gap (see _compute_autonav_cmd) -- persistence gate for whether a
+        # departure from the box is "real" (correct it) or noise/settling (ignore it either way).
+        self._autonav_gap_ema = 0.0
         # warm the ONNX once so a frame-0 clip value exists before the first real obs
         self._prime_clip()
 
@@ -578,6 +601,7 @@ class UnifiedLocoKickPolicy(Policy):
         (x_lo, x_hi), (y_lo, y_hi) = box
         ball_x, ball_y = float(ball_pos_b[0]), float(ball_pos_b[1])
         if x_lo <= ball_x <= x_hi and y_lo <= ball_y <= y_hi:
+            self._autonav_gap_ema = 0.0  # reset the filter -- genuinely arrived, nothing to track
             return np.zeros(3)  # arrived -- hold, don't chase a shrinking residual to exactly zero
 
         target_x, target_y = 0.5 * (x_lo + x_hi), 0.5 * (y_lo + y_hi)
@@ -592,6 +616,29 @@ class UnifiedLocoKickPolicy(Policy):
         gap_x = max(x_lo - ball_x, ball_x - x_hi, 0.0)
         gap_y = max(y_lo - ball_y, ball_y - y_hi, 0.0)
         gap = float(np.hypot(gap_x, gap_y))
+
+        # Whether to react AT ALL is decided from a LOW-PASS FILTERED gap, not the raw one -- this
+        # is a persistence gate, not an amplitude gate. A flat "ignore gaps under X cm" deadband
+        # can't serve both failure modes actually observed: big enough to swallow the few-cm,
+        # few-tick residuals from post-approach settling / gait sway (else autonav answers with a
+        # tiny but NONZERO command that straddles zero_cmd_eps tick to tick, repeatedly flips
+        # _update_phase's is_standing, and force-resets the gait phase mid-settle -- observed to
+        # cascade into the robot lurching the ball back out by tens of cm), but small enough to
+        # still correct a SLOW, PERSISTENT drift (measured: the standing policy alone, no autonav
+        # input at all, drifts the ball ~0.1 m over ~20-30s) before it walks the ball out of the
+        # (tighter) readiness-gesture box for good. A flat deadband picks one and fails the other --
+        # 4 cm tolerates the settling noise but the slow drift never exceeds it within a real
+        # session, so the readiness gesture engages once then goes dark permanently; a 1-2 cm
+        # deadband corrects the drift but reacts to the settling noise almost as often as no
+        # deadband at all (same phase-flip cascade). The EMA breaks the tie by persistence instead
+        # of amplitude: a several-tick blip barely moves it (stays under the now-small deadband), a
+        # multi-second drift reaches the raw gap's value within about one time constant and crosses
+        # it just as reliably as the raw signal would. Reset to 0 above whenever truly arrived, so a
+        # stale filtered value from a past excursion never biases the next one.
+        ema_alpha = 1.0 / (self._AUTONAV_GAP_EMA_TAU_S * self.freq + 1.0)  # ~= dt/(dt+tau), dt=1/freq
+        self._autonav_gap_ema += ema_alpha * (gap - self._autonav_gap_ema)
+        if self._autonav_gap_ema < self._AUTONAV_GAP_DEADBAND_M:
+            return np.zeros(3)
         speed = min(self._autonav_kp_approach * gap, self._autonav_max_speed)
         direction = nav_error / n if n > 1e-6 else np.zeros(2)  # aim for the centre, not just the edge
         vx, vy = speed * direction

@@ -92,7 +92,7 @@ from robojudo.tools.tool_cfgs import DoFConfig
 
 DEFAULT_ONNX_PATH = (
     "/workspaces/isaaclab_arena/submodules/workspaces/playground/unified_ball_kick_enhanced/logs/"
-    "UnifiedBallKickingEnhanced/20260904_021435-stageC-skill012-h074-locomotion/model_0490000.onnx"
+    "UnifiedBallKickingEnhanced/20260905_100147-distill-6skills-121617181920-distill/model_0600000.onnx"
 )
 
 

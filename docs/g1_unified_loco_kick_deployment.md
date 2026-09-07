@@ -293,15 +293,53 @@ Needs `--live-ball`; no-op on a checkpoint without `skill_ball_xy` metadata for 
   there just rotates the ball's apparent position back out.
 - While auto-nav drives, the shared rate-limiter's deceleration is sped up 3× (safe — auto-nav
   works at low speed, unlike halting a full-speed manual walk).
+- Whether to react **at all** once outside the box is gated on a **low-pass filtered** gap
+  (`_autonav_gap_ema`, ~0.4 s time constant), not the instantaneous one — see
+  [Readiness gesture reliability](#-readiness-gesture-reliability-why-it-can-feel-strict) below for
+  why a flat distance threshold can't do this job alone.
 
 **Verified**, real MuJoCo physics + the real trained ONNX (not a mock):
 - Sign conventions empirically confirmed, not just derived: `ang_vel = +0.8` → `+37.75°` of actual
   yaw over 80 ticks, `−0.8` → `−34.44°` (positive = turn-left).
 - Overshoot/escape (the reason for the gap-scaling): approaches from mild-left, 2 m straight, 2 m
-  diagonal, and hard-right all converge and **stay** in the box — `0` ticks outside the box over a
-  16 s hold-and-watch window each, final speed `0.000`, no falls. The earlier `kp·|nav_error|` law
-  arrived carrying real speed and walked the ball straight through the far side.
+  diagonal, and hard-right all converge and stay in the box, final speed `0.000`, no falls. The
+  earlier `kp·|nav_error|` law arrived carrying real speed and walked the ball straight through the
+  far side.
 - Tune `autonav_kp_approach` / `autonav_max_speed` down for a gentler approach if needed.
+
+---
+
+# 🎯 Readiness gesture reliability (why it can feel "strict")
+
+The readiness gesture (right arm swings, see [Keyboard Controls](#%EF%B8%8F-keyboard-controls)
+above) only engages while `ball_pos_b` is inside the selected skill's exact trained box. Two real,
+measured effects can make it look stricter than expected:
+
+1. **A real bug, now fixed**: right after auto-nav settles from an approach, if the ball's apparent
+   position hovered a few cm outside the box for a run of ticks, auto-nav answered with a tiny but
+   NONZERO command — small, but exactly the kind of signal that straddles `zero_cmd_eps` tick to
+   tick, which repeatedly flipped the gait phase's `is_standing` state and force-reset the gait
+   phase mid-settle. Observed to cascade into the robot lurching the ball back out by tens of cm,
+   which is what actually made the gesture look "strict, only sometimes" — the gesture logic itself
+   was fine, the approach just wasn't settling. Fixed by gating auto-nav's reaction on a low-pass
+   filtered gap instead of the raw one (see the control law above) — corrections near the goal now
+   stay gentle (`|ang_vel| ≤ 0.16` measured, vs. the old ±0.8 spikes).
+2. **Not a bug — an inherent property of this checkpoint's standing behavior**: measured with
+   auto-nav and the gesture both **fully OFF**, just standing still: the ball's apparent position
+   drifts **~0.1 m over 20–30 s** even with zero commanded velocity the entire time. It's a real,
+   slow drift in how this policy holds "standing" in this sim2sim setup, not something introduced by
+   RoboJuDo. Given enough continuous standing time, it *will* eventually walk the ball out of the
+   (fairly tight, ~0.1–0.15 m halfwidth) trained box on its own.
+
+Auto-nav's filtered-gap correction (point 1's fix) also substantially mitigates point 2 — it
+re-engages once the drift's low-passed value crosses `autonav_kp_approach`'s deadband, extending how
+long the gesture stays reliably lit compared to auto-nav being off entirely. It does not fully
+eliminate the effect: for some approach geometries the ball can settle a few mm outside the box and
+sit there indefinitely (the residual just doesn't clear the noise-rejection deadband) — still stable
+and bounded (zero velocity, no falls), just not perfectly centered. If this shows up in practice,
+lowering `UnifiedLocoKickPolicy._AUTONAV_GAP_DEADBAND_M` trades a bit more gait-phase churn for
+tighter long-run correction (swept empirically; even far smaller values never caused a fall in
+testing, just more frequent phase resets).
 
 ---
 

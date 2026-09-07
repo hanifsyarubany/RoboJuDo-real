@@ -816,6 +816,19 @@ class TestAutoNav(unittest.TestCase):
             **kw,
         )
 
+    def _settle(self, p, ball, n=60):
+        """Call _compute_autonav_cmd n times with the SAME (constant) ball reading and return the
+        LAST result -- the gap-gate is a low-pass filter (_autonav_gap_ema) that needs several
+        ticks of a persistent gap to cross its deadband, so a single bare call under-reports
+        whether the steady-state law would actually engage. Once the filter HAS crossed the
+        deadband, the returned vx/vy/yaw are computed from the CURRENT tick's raw gap/nav_error
+        (the filter only gates whether to react, not the magnitude), so exact-value assertions
+        against the control-law formula are unaffected by how many ticks were used to get there."""
+        cmd = np.zeros(3)
+        for _ in range(n):
+            cmd = p._compute_autonav_cmd(ball)
+        return cmd
+
     # ---- [TOGGLE_AUTONAV] command ----
 
     def test_toggle_is_a_warned_noop_when_disabled_in_cfg(self):
@@ -844,10 +857,43 @@ class TestAutoNav(unittest.TestCase):
         cmd = p._compute_autonav_cmd(np.array([1.0, 0.0, 0.11]))
         np.testing.assert_array_equal(cmd, [0.0, 0.0, 0.0])
 
+    def test_arriving_resets_the_gap_filter(self):
+        p = self._p()
+        self._settle(p, np.array([1.5, 0.2, 0.11]))  # build up a nonzero filtered gap
+        self.assertGreater(p._autonav_gap_ema, 0.0)
+        p._compute_autonav_cmd(np.array([1.0, 0.0, 0.11]))  # dead-center of the box -- arrived
+        self.assertEqual(p._autonav_gap_ema, 0.0, "a stale filtered value must not bias the NEXT excursion")
+
+    # ---- the persistence gate (_autonav_gap_ema) ----
+
+    def test_fresh_single_call_with_a_moderate_gap_does_not_yet_react(self):
+        # THE FIX for "still reacts to a few-cm settling/sway blip": whether to react at all is
+        # gated on a LOW-PASS FILTERED gap, not the instantaneous one, so a single tick outside the
+        # box is not (by itself) enough to command anything.
+        p = self._p()
+        cmd = p._compute_autonav_cmd(np.array([1.15, 0.0, 0.11]))  # gap = 0.05, one call only
+        np.testing.assert_array_equal(cmd, [0.0, 0.0, 0.0])
+
+    def test_persistent_gap_below_deadband_never_reacts_even_after_settling(self):
+        # a gap that stays small FOREVER (not just for one tick) must still never command anything
+        # -- the filter converges toward the true gap, which itself never crosses the deadband.
+        p = self._p()  # box x_hi = 1.1
+        cmd = self._settle(p, np.array([1.105, 0.0, 0.11]), n=200)  # gap = 0.005 < 0.010 deadband
+        np.testing.assert_array_equal(cmd, [0.0, 0.0, 0.0])
+
+    def test_persistent_gap_above_deadband_eventually_reacts(self):
+        # the SAME small-ish gap, sustained, DOES eventually get corrected once the filter catches
+        # up -- this is what fixes "drifts out of the box and never comes back."
+        p = self._p()  # box x_hi = 1.1
+        cmd = self._settle(p, np.array([1.12, 0.0, 0.11]))  # gap = 0.02, above the 0.010 deadband
+        self.assertGreater(cmd[0], 0.0)
+
+    # ---- steady-state control law (post-settle) ----
+
     def test_drives_toward_the_box_center_with_the_right_sign(self):
         p = self._p()  # skill 0 box centered (1.0, 0.0); ball farther forward AND to the left
         ball = np.array([1.5, 0.2, 0.11])
-        cmd = p._compute_autonav_cmd(ball)
+        cmd = self._settle(p, ball)
         # nav_error = (0.5, 0.2) -> vx, vy both positive (walk forward + left); yaw positive (left)
         self.assertGreater(cmd[0], 0.0)
         self.assertGreater(cmd[1], 0.0)
@@ -857,14 +903,14 @@ class TestAutoNav(unittest.TestCase):
 
     def test_opposite_error_gives_opposite_sign_command(self):
         p = self._p()
-        cmd = p._compute_autonav_cmd(np.array([1.5, -0.2, 0.11]))  # forward AND to the right
+        cmd = self._settle(p, np.array([1.5, -0.2, 0.11]))  # forward AND to the right
         self.assertGreater(cmd[0], 0.0)
         self.assertLess(cmd[1], 0.0, "ball to the right of target -> walk right -> negative vy")
         self.assertLess(cmd[2], 0.0, "ball to the right -> turn right (negative yaw)")
 
     def test_speed_is_capped_at_max_speed_when_far_from_the_box(self):
         p = self._p()  # box (0.9,1.1)x(-0.1,0.1)
-        cmd = p._compute_autonav_cmd(np.array([4.0, 0.0, 0.11]))  # ball 2.9 m past the far edge
+        cmd = self._settle(p, np.array([4.0, 0.0, 0.11]))  # ball 2.9 m past the far edge
         self.assertAlmostEqual(float(np.linalg.norm(cmd[:2])), self._MAXV, places=6)
 
     def test_speed_scales_DOWN_with_the_box_gap_near_the_zone(self):
@@ -872,7 +918,7 @@ class TestAutoNav(unittest.TestCase):
         # centre -- so the robot is already crawling by the time the ball reaches the zone instead
         # of blowing through it. Ball just 5 cm past the near edge -> tiny speed, not kp*halfwidth.
         p = self._p()  # box x in (0.9, 1.1)
-        cmd = p._compute_autonav_cmd(np.array([1.15, 0.0, 0.11]))  # gap_x = 1.15 - 1.10 = 0.05
+        cmd = self._settle(p, np.array([1.15, 0.0, 0.11]))  # gap_x = 1.15 - 1.10 = 0.05
         speed = float(np.linalg.norm(cmd[:2]))
         self.assertAlmostEqual(speed, self._KPA * 0.05, places=5)
         self.assertLess(speed, 0.1, "a 5 cm gap must command a crawl, not a stride")
@@ -880,13 +926,13 @@ class TestAutoNav(unittest.TestCase):
     def test_yaw_is_dropped_entirely_once_within_the_min_gap_of_the_box(self):
         p = self._p()  # box (0.9,1.1)x(-0.1,0.1), _AUTONAV_YAW_MIN_GAP_M = 0.15
         # ball 5 cm past the near edge and 12 cm off-axis: still outside, but gap ~0.13 < 0.15
-        cmd = p._compute_autonav_cmd(np.array([1.15, 0.22, 0.11]))
+        cmd = self._settle(p, np.array([1.15, 0.22, 0.11]))
         self.assertEqual(cmd[2], 0.0, "near the zone, vx/vy do the fine positioning -- no residual turn")
         self.assertGreater(np.linalg.norm(cmd[:2]), 0.0, "but it's still nudging into the box")
 
     def test_yaw_applies_and_is_well_conditioned_while_still_far(self):
         p = self._p()  # ball far and to the left -> real turn wanted, and it must not saturate
-        cmd = p._compute_autonav_cmd(np.array([2.5, 0.3, 0.11]))
+        cmd = self._settle(p, np.array([2.5, 0.3, 0.11]))
         self.assertGreater(cmd[2], 0.0)
         # denominator is max(ball.x, 0.3) = 2.5, NOT nav_error.x -- a few-deg turn, not a spin
         np.testing.assert_allclose(cmd[2], 2.0 * np.arctan2(0.3, 2.5), atol=1e-6)
@@ -894,19 +940,19 @@ class TestAutoNav(unittest.TestCase):
     def test_yaw_deadband_zeros_sub_degree_heading_residuals(self):
         p = self._p()
         # ball far in x (gap > 0.15 so yaw is eligible) but essentially dead-ahead laterally
-        cmd = p._compute_autonav_cmd(np.array([2.0, 0.005, 0.11]))
+        cmd = self._settle(p, np.array([2.0, 0.005, 0.11]))
         self.assertGreater(cmd[0], 0.0, "still needs to walk forward")
         self.assertEqual(cmd[2], 0.0, "a <4deg heading error must not make the heading hunt")
 
     def test_yaw_denominator_floored_when_ball_far_but_nearly_beside_the_robot(self):
         p = self._p()
-        cmd = p._compute_autonav_cmd(np.array([0.2, 1.5, 0.11]))  # ball way out to the left, close in x
+        cmd = self._settle(p, np.array([0.2, 1.5, 0.11]))  # ball way out to the left, close in x
         # fwd_for_yaw = max(0.2, 0.3) = 0.3 (floored) -> atan2(1.5, 0.3), bounded, clamps to a real turn
         np.testing.assert_allclose(cmd[2], np.clip(2.0 * np.arctan2(1.5, 0.3), -0.8, 0.8), atol=1e-6)
 
     def test_linear_command_clamps_to_cmd_max_mag(self):
         p = self._p(autonav_kp_approach=100.0, autonav_max_speed=100.0)
-        cmd = p._compute_autonav_cmd(np.array([5.0, 5.0, 0.11]))
+        cmd = self._settle(p, np.array([5.0, 5.0, 0.11]))
         self.assertLessEqual(abs(cmd[0]), p._cmd_max_mag[0] + 1e-9)
         self.assertLessEqual(abs(cmd[1]), p._cmd_max_mag[1] + 1e-9)
 
