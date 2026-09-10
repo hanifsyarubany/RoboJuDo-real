@@ -139,6 +139,7 @@ one. See `_compute_autonav_cmd`.
 from __future__ import annotations
 
 import logging
+import os
 
 import numpy as np
 import onnxruntime as ort
@@ -187,7 +188,25 @@ class UnifiedLocoKickPolicy(Policy):
     def __init__(self, cfg_policy: UnifiedLocoKickPolicyCfg, device):
         device = "cpu"
         providers = ["CPUExecutionProvider"]
-        self.session = ort.InferenceSession(cfg_policy.policy_file, ort.SessionOptions(), providers=providers)
+        sess_options = ort.SessionOptions()
+        # 2026-09-09: opt-in thread cap, env-gated rather than hardcoded, since this class also
+        # drives the real robot's single, latency-sensitive control loop -- there a bigger ORT
+        # thread pool can genuinely help per-tick inference latency, and there is only ever ONE
+        # live session, so there is nothing to oversubscribe against. Unset (the real-robot case,
+        # and every existing caller) leaves ORT's own default thread-count heuristic untouched --
+        # zero behavior change there. Set by the sim2sim eval harness's own record_*_scan.py
+        # wrappers before launching each worker subprocess: those run MANY concurrent single-trial
+        # sessions BY DESIGN (sim2sim_eval.py's own max_concurrent_scans), so each session
+        # defaulting to a large thread pool (observed: 67 threads on a 128-core box, ~9x
+        # oversubscribed at 18 concurrent workers) starves every other worker instead of adding
+        # real throughput -- the parallelism there comes from process count, not per-session
+        # threading.
+        num_threads_str = os.environ.get("ROBOJUDO_ORT_INTRA_OP_NUM_THREADS")
+        if num_threads_str:
+            num_threads = int(num_threads_str)
+            sess_options.intra_op_num_threads = num_threads
+            sess_options.inter_op_num_threads = num_threads
+        self.session = ort.InferenceSession(cfg_policy.policy_file, sess_options, providers=providers)
         self.input_names = [i.name for i in self.session.get_inputs()]
         self.output_names = [o.name for o in self.session.get_outputs()]
 
@@ -409,6 +428,10 @@ class UnifiedLocoKickPolicy(Policy):
         self._cmd_decel_limit_per_tick = (axis_max_mag / decel_time) / self.freq
         self._cmd_zero_snap = cfg_policy.command_zero_snap
 
+        # ---- decel-then-fire kick entry (see policy_cfgs.py's own field comment) ----
+        self._kick_entry_decel_enabled = cfg_policy.kick_entry_decel_enabled
+        self._kick_entry_settle_ticks = max(1, int(round(cfg_policy.kick_entry_settle_s * self.freq)))
+
         self.reset()
 
     # ------------------------------------------------------------------ #
@@ -437,6 +460,14 @@ class UnifiedLocoKickPolicy(Policy):
         # which is meaningless outside an active kick) so cycling with the robot standing still
         # actually sticks until the next kick.
         self._selected_skill_id = 0
+        # decel-then-fire kick entry (see policy_cfgs.py's own field comment). None = no kick
+        # pending -- [TRIGGER_KICK] fires immediately (kick_entry_decel_enabled=False's exact
+        # prior behavior) or, when enabled, sets this to the requested skill_id and forces the
+        # velocity command toward zero (_update_velocity_command) until self.is_standing has held
+        # for _kick_entry_settle_ticks (counted down here, in post_step_callback), at which point
+        # _trigger_kick actually fires and both fields below reset to None/0.
+        self._pending_kick_skill_id: int | None = None
+        self._kick_entry_settle_ticks_remaining = 0
         self.motion_clip_progressing = False
         self._kick_hold_ticks = 0
         self.motion_command_t = np.zeros(2 * self.num_dofs)  # [joint_pos(29), joint_vel(29)]
@@ -555,6 +586,15 @@ class UnifiedLocoKickPolicy(Policy):
             logger.info("[UnifiedLocoKick] auto-nav CANCELLED -- manual locomotion input detected")
 
         cmd = self._compute_autonav_cmd(ball_pos_b) if self._autonav_user_on else manual_cmd
+
+        # Decel-then-fire kick entry (see policy_cfgs.py's own field comment): a pending kick
+        # OVERRIDES manual/autonav input with zero, regardless of what the operator is doing --
+        # deliberate, not a bug. The whole point is a stop the operator doesn't have to hold
+        # still for themselves; letting stick input keep steering here would defeat it. Applied
+        # AFTER autonav/manual resolution, BEFORE the rate limiter below, so the existing,
+        # already-tuned command_decel_time ramp (not new arithmetic) carries it down to zero.
+        if self._pending_kick_skill_id is not None:
+            cmd = np.zeros(3)
 
         # Per-axis asymmetric rate limit: accelerating (|target| growing) uses the slow ramp,
         # decelerating uses the fast decel limit, and once the target is zero and the smoothed
@@ -1031,7 +1071,7 @@ class UnifiedLocoKickPolicy(Policy):
     def post_step_callback(self, commands: list[str] | None = None):
         for command in commands or []:
             if command == "[TRIGGER_KICK]":
-                self._trigger_kick(skill_id=self._selected_skill_id)
+                self._request_kick(skill_id=self._selected_skill_id)
             elif command.startswith("[TRIGGER_KICK:") and command.endswith("]"):
                 # "[TRIGGER_KICK:N]" -- select which of the ONNX's embedded skills to kick (see
                 # this module's docstring). Falls back to skill 0 with a warning if the requested
@@ -1049,7 +1089,7 @@ class UnifiedLocoKickPolicy(Policy):
                         f"(0..{len(self._skill_start_idx) - 1}), defaulting to skill 0"
                     )
                     skill_id = 0
-                self._trigger_kick(skill_id=skill_id)
+                self._request_kick(skill_id=skill_id)
             elif command == "[CYCLE_KICK_SKILL]":
                 # Advances the PENDING selection only -- never kicks, never touches kick_skill_id
                 # (which stays meaningless/stale until the next actual trigger). Safe to press
@@ -1097,7 +1137,26 @@ class UnifiedLocoKickPolicy(Policy):
                     self._autonav_user_on = not self._autonav_user_on
                     logger.info(f"[UnifiedLocoKick] auto-nav {'ON' if self._autonav_user_on else 'OFF'}")
             elif command == "[RETURN_TO_LOCO]":
+                if self._pending_kick_skill_id is not None:
+                    logger.info("[UnifiedLocoKick] pending kick entry CANCELLED")
+                    self._pending_kick_skill_id = None
+                    self._kick_entry_settle_ticks_remaining = 0
                 self._return_to_loco()
+
+        if self._pending_kick_skill_id is not None:
+            # Decel-then-fire kick entry (see policy_cfgs.py's own field comment). Velocity is
+            # already being forced toward zero in _update_velocity_command; this just watches
+            # self.is_standing (set this same tick, get_observation runs before post_step_callback)
+            # for _kick_entry_settle_ticks CONSECUTIVE standing ticks before actually firing --
+            # any tick that isn't standing (still decelerating, or briefly kicked back out of it)
+            # resets the count rather than accumulating through it.
+            if self.is_standing:
+                self._kick_entry_settle_ticks_remaining -= 1
+                if self._kick_entry_settle_ticks_remaining <= 0:
+                    self._trigger_kick(skill_id=self._pending_kick_skill_id)
+                    self._pending_kick_skill_id = None
+            else:
+                self._kick_entry_settle_ticks_remaining = self._kick_entry_settle_ticks
 
         if self.task_mode == _TASK_KICK and self.motion_clip_progressing:
             if self._kick_recovery_locomotion_flip_enabled and self._pre_recovery_idx:
@@ -1154,6 +1213,21 @@ class UnifiedLocoKickPolicy(Policy):
             x, y = self._skill_target_xy[skill_id]
             return float(x), float(y)
         return None
+
+    def _request_kick(self, skill_id: int = 0):
+        """Entry point for [TRIGGER_KICK]/[TRIGGER_KICK:N] -- routes to an immediate _trigger_kick
+        (kick_entry_decel_enabled=False, exact prior behavior) or arms the decel-then-fire state
+        machine (see policy_cfgs.py's own field comment, and the settle-countdown block in
+        post_step_callback). A second request while one is already pending RETARGETS the skill
+        (e.g. [CYCLE_KICK_SKILL] then [TRIGGER_KICK] again before the decel finishes) without
+        restarting the ramp/settle progress already made -- deliberately not a full reset, so
+        repeated presses can't indefinitely stall entry."""
+        if not self._kick_entry_decel_enabled:
+            self._trigger_kick(skill_id=skill_id)
+            return
+        if self._pending_kick_skill_id is None:
+            logger.info(f"[UnifiedLocoKick] kick requested (skill_id={skill_id}) -- decelerating before entry")
+        self._pending_kick_skill_id = skill_id
 
     def _trigger_kick(self, skill_id: int = 0):
         # capture yaw offsets at the trigger instant: robot from current torso orientation, motion

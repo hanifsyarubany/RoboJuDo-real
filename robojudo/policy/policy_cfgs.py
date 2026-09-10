@@ -494,6 +494,42 @@ class UnifiedLocoKickPolicyCfg(PolicyCfg):
     command_decel_time: float = 1.0
     command_zero_snap: float = 0.02
 
+    # --- decel-then-fire kick entry (2026-09-08, "Path A" in memory
+    # loco_to_kick_handoff_sim2sim_drift_analysis_and_fix_strategy.md) ---
+    # Training rehearses kick entry two ways -- a hard teleport at episode start, or Stage D's
+    # state-matched search-then-blend mid-episode -- but deployment's own [TRIGGER_KICK] does
+    # NEITHER: it keeps the robot's live walking state and snaps the reference straight to frame 0
+    # with no state-matching and no blend, a third combination training never rehearses. That
+    # mismatch is the leading suspected cause of a real, user-observed handoff hit-rate drop
+    # (kicks reliably from a settled stand, misses more after a sudden mid-walk trigger).
+    #
+    # When True: [TRIGGER_KICK]/[TRIGGER_KICK:N] no longer fires immediately. Instead the
+    # commanded velocity is forced to zero -- reusing the EXACT SAME, already-tuned
+    # command_decel_time/command_zero_snap ramp above (empirically 0/10 falls stopping from 0.8
+    # m/s over 1.0s, vs 8/10 for an instant cut -- see that field's own comment), not new ramp
+    # arithmetic -- and the kick fires only once self.is_standing has held for kick_entry_settle_s
+    # afterward. This converts entry into something close to mujoco_kick_survival_scan.py's own
+    # settled-standstill start (reset -> 1.5s zero-vel settle -> trigger), which checkpoints that
+    # actually kick already generalize to from training's teleported initial condition.
+    #
+    # Real costs, not free: (1) kick latency -- roughly command_decel_time + kick_entry_settle_s
+    # from an initial fast walk, no longer instant; (2) Stage D's state-matched entry search goes
+    # entirely unused at deployment -- sidestepping it, not using it, a real strategic choice; (3)
+    # UNVALIDATED risk -- zero commanded velocity doesn't guarantee the same STANCE a keyframe
+    # reset produces (a robot decelerating from a walking gait can settle mid-stride, asymmetric
+    # weight/staggered feet), which frame 0 doesn't account for. Only a real Delta-hit_rate
+    # measurement (paired kick_survival vs. loco_to_kick_handoff, the user's own stated success
+    # criterion) resolves whether that risk matters in practice. Default False: zero behavior
+    # change for every existing deployment until explicitly opted into and measured.
+    kick_entry_decel_enabled: bool = False
+    # Extra hold time AFTER the commanded velocity ramp reaches near-zero (self.is_standing),
+    # before actually firing -- the ramp reaching zero-COMMAND doesn't mean the robot's real
+    # physical velocity has finished settling yet. 0.5s is a starting point, not a measured
+    # optimum; mujoco_kick_survival_scan.py's own reference settle window is longer (1.5s) but
+    # that script settles from a hard keyframe reset, not a live decel -- tune against a real
+    # Delta-hit_rate measurement rather than assuming either number transfers.
+    kick_entry_settle_s: float = 0.5
+
     # --- "ball is in the SELECTED skill's trained range" readiness gesture ---
     # When ENABLED, and a live ball reading is available (--live-ball): while ball_pos_b's (x, y)
     # stays inside the CURRENTLY SELECTED skill's trained ball box -- skill_ball_xy[sel] +-

@@ -82,6 +82,8 @@ def _make_policy(
     autonav_max_speed=0.35,
     autonav_kp_yaw=2.0,
     autonav_manual_deadzone=0.05,
+    kick_entry_decel_enabled=False,
+    kick_entry_settle_s=0.5,
 ) -> UnifiedLocoKickPolicy:
     p = object.__new__(UnifiedLocoKickPolicy)
     p.session = _FakeSession(ref_quat_table)
@@ -138,6 +140,9 @@ def _make_policy(
     p._cmd_decel_limit_per_tick = np.array([1000.0, 1000.0, 1000.0])
     p._cmd_zero_snap = 0.02
     p.zero_cmd_eps = 0.01
+    # decel-then-fire kick entry attrs normally set in __init__ (bypassed here by object.__new__)
+    p._kick_entry_decel_enabled = kick_entry_decel_enabled
+    p._kick_entry_settle_ticks = max(1, int(round(kick_entry_settle_s * p.freq)))
     p.reset()
     p._ready_gesture_user_on = ready_gesture_user_on  # reset() sets it False; override after
     return p
@@ -1023,6 +1028,102 @@ class TestAutoNav(unittest.TestCase):
         ctrl_data = {"KeyboardCtrl": {"keyboard_event": [{"type": "keyboard", "name": "w", "pressed": True}]}}
         p._update_velocity_command(ctrl_data, None)
         self.assertGreater(p.lin_vel_command[0], 0.0)
+
+
+class TestKickEntryDecel(unittest.TestCase):
+    """Decel-then-fire kick entry (2026-09-08, "Path A" in memory loco_to_kick_handoff_sim2sim_
+    drift_analysis_and_fix_strategy.md) -- see policy_cfgs.py's own field comment for the full
+    rationale. These test the STATE MACHINE (post_step_callback's pending/settle bookkeeping,
+    _update_velocity_command's forced-zero override) in isolation via is_standing set directly --
+    the velocity ramp ITSELF (command_decel_time etc.) is pre-existing, unmodified code with its
+    own coverage elsewhere in this file (the autonav/manual _update_velocity_command tests above),
+    not re-tested here."""
+
+    def test_disabled_fires_immediately_unchanged(self):
+        """kick_entry_decel_enabled=False (the default) must be BYTE-IDENTICAL to this class's
+        pre-2026-09-08 behavior -- no pending state, no latency, for every existing deployment
+        that hasn't opted in."""
+        p = _make_policy([0], [], {0.0: _identity_quat()}, kick_entry_decel_enabled=False)
+        p.post_step_callback(["[TRIGGER_KICK]"])
+        self.assertEqual(p.task_mode, _TASK_KICK)
+        self.assertIsNone(p._pending_kick_skill_id)
+
+    def test_enabled_does_not_fire_immediately(self):
+        p = _make_policy([0], [], {0.0: _identity_quat()}, kick_entry_decel_enabled=True)
+        p.post_step_callback(["[TRIGGER_KICK]"])
+        self.assertEqual(p.task_mode, _TASK_LOCOMOTION)
+        self.assertEqual(p._pending_kick_skill_id, 0)
+
+    def test_update_velocity_command_forces_zero_while_pending_regardless_of_manual_input(self):
+        p = _make_policy([0], [], {0.0: _identity_quat()}, kick_entry_decel_enabled=True)
+        p._pending_kick_skill_id = 0
+        ctrl_data = {"JoystickCtrl": {"axes": {"LeftX": 0.0, "LeftY": 1.0, "RightX": 0.0}}}
+        p._update_velocity_command(ctrl_data, None)
+        # commands_map[0] max magnitude is 0.8 -- a real forward push would read lin_vel_command[0]
+        # near that; forced-zero must override it to exactly 0 regardless (large test rate limits
+        # from _make_policy converge _smoothed_cmd to its target in a single tick).
+        self.assertEqual(p.lin_vel_command[0], 0.0)
+        self.assertEqual(p.ang_vel_command, 0.0)
+
+    def test_fires_after_settle_ticks_of_continuous_standing(self):
+        p = _make_policy([0], [], {0.0: _identity_quat()}, kick_entry_decel_enabled=True, kick_entry_settle_s=0.1)
+        settle_ticks = p._kick_entry_settle_ticks  # 0.1s * 50Hz = 5
+        p.post_step_callback(["[TRIGGER_KICK]"])
+        p.is_standing = True
+        for _ in range(settle_ticks - 1):
+            p.post_step_callback([])
+            self.assertEqual(p.task_mode, _TASK_LOCOMOTION, "must not fire before the settle window elapses")
+        p.post_step_callback([])
+        self.assertEqual(p.task_mode, _TASK_KICK)
+        self.assertIsNone(p._pending_kick_skill_id)
+
+    def test_leaving_standing_resets_the_settle_countdown(self):
+        p = _make_policy([0], [], {0.0: _identity_quat()}, kick_entry_decel_enabled=True, kick_entry_settle_s=0.1)
+        settle_ticks = p._kick_entry_settle_ticks
+        p.post_step_callback(["[TRIGGER_KICK]"])
+        p.is_standing = True
+        for _ in range(settle_ticks - 1):  # almost all the way through the settle window...
+            p.post_step_callback([])
+        p.is_standing = False  # ...then a single non-standing tick (e.g. still decelerating)
+        p.post_step_callback([])
+        p.is_standing = True
+        for _ in range(settle_ticks - 1):  # must need the FULL window again, not just the 1 tick short
+            p.post_step_callback([])
+            self.assertEqual(p.task_mode, _TASK_LOCOMOTION)
+        p.post_step_callback([])
+        self.assertEqual(p.task_mode, _TASK_KICK)
+
+    def test_return_to_loco_cancels_a_pending_kick(self):
+        p = _make_policy([0], [], {0.0: _identity_quat()}, kick_entry_decel_enabled=True)
+        p.post_step_callback(["[TRIGGER_KICK]"])
+        p.is_standing = True
+        p.post_step_callback(["[RETURN_TO_LOCO]"])
+        self.assertIsNone(p._pending_kick_skill_id)
+        self.assertEqual(p.task_mode, _TASK_LOCOMOTION)
+        # cancellation must actually stick -- further standing ticks must NOT still fire it.
+        for _ in range(p._kick_entry_settle_ticks + 2):
+            p.post_step_callback([])
+        self.assertEqual(p.task_mode, _TASK_LOCOMOTION)
+
+    def test_second_trigger_while_pending_retargets_without_resetting_progress(self):
+        p = _make_policy([0, 200], [200, 400], {0.0: _identity_quat(), 200.0: _identity_quat()},
+                          kick_entry_decel_enabled=True, kick_entry_settle_s=0.1)
+        settle_ticks = p._kick_entry_settle_ticks
+        p.post_step_callback(["[TRIGGER_KICK:0]"])
+        p.is_standing = True
+        # Same "-1" counting as test_fires_after_settle_ticks_of_continuous_standing: settle_ticks-1
+        # standing decrements land exactly one short of firing, so the NEXT call is the one that
+        # would fire -- here that next call is the retarget itself.
+        for _ in range(settle_ticks - 1):
+            p.post_step_callback([])
+        self.assertEqual(p._pending_kick_skill_id, 0)
+        self.assertEqual(p.task_mode, _TASK_LOCOMOTION, "must not have fired yet")
+        p.post_step_callback(["[TRIGGER_KICK:1]"])  # retarget: command loop runs BEFORE this same
+        # call's own countdown check, so the retarget takes effect and (since progress carried
+        # over rather than resetting) this single call both retargets AND fires it, immediately.
+        self.assertEqual(p.task_mode, _TASK_KICK)
+        self.assertEqual(p.kick_skill_id, 1, "must have fired the RETARGETED skill, not the original")
+        self.assertIsNone(p._pending_kick_skill_id)
 
 
 if __name__ == "__main__":
