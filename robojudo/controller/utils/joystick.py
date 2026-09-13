@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 _REMOTE_AXIS_SANITY_BOUND = 1.5
 _REMOTE_AXIS_WARN_INTERVAL_S = 1.0  # rate-limit the invalid-reading warning, don't spam per-tick
 
+_REMOTE_DIAG_REPORT_INTERVAL_S = 5.0  # how often to log the parse()-rate / repeated-buffer summary
+
 os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "hide"
 
 
@@ -226,6 +228,66 @@ class unitreeRemoteController:
         self.last_axes = {"LeftX": 0.0, "LeftY": 0.0, "RightX": 0.0, "RightY": 0.0}
         self._last_axis_warn_t = 0.0
 
+        # --- update-rate / staleness diagnostic (log-only, changes no behavior) ---
+        # Answers "how often does parse() actually get called, and is it ever handed the exact
+        # same bytes twice in a row" -- unlike JoystickCtrl's sim path (a dedicated thread polling
+        # the SDL gamepad at up to 500Hz, decoupled from the 50Hz control loop), UnitreeCtrl skips
+        # that thread entirely and wires this parse() call directly into env.update(), i.e. it only
+        # ever runs at whatever cadence the control loop itself actually achieves -- see this
+        # module's own real-vs-sim rate discussion. A byte-identical consecutive buffer is
+        # consistent with EITHER the stick genuinely not having moved (same physical position ->
+        # same ADC reading -> same encoded bytes) OR the underlying SDK feed not refreshing every
+        # tick -- this cannot distinguish the two on its own, so the periodic summary reports the
+        # raw numbers and leaves interpretation to whether the stick was actually being moved at
+        # the time.
+        self._diag_last_call_t: float | None = None
+        self._diag_last_raw: bytes | None = None
+        self._diag_samples = 0  # number of call-to-call gaps observed in the current window
+        self._diag_repeat_count = 0
+        self._diag_repeat_streak = 0
+        self._diag_max_repeat_streak = 0
+        self._diag_dt_sum = 0.0
+        self._diag_dt_max = 0.0
+        self._diag_last_report_t = time.time()
+
+    def _update_rate_diagnostic(self, remote_data) -> None:
+        now = time.time()
+        raw = bytes(remote_data)  # snapshot -- defensive in case the caller reuses its buffer
+
+        if self._diag_last_call_t is not None:
+            dt = now - self._diag_last_call_t
+            self._diag_dt_sum += dt
+            self._diag_dt_max = max(self._diag_dt_max, dt)
+            self._diag_samples += 1
+            if raw == self._diag_last_raw:
+                self._diag_repeat_count += 1
+                self._diag_repeat_streak += 1
+                self._diag_max_repeat_streak = max(self._diag_max_repeat_streak, self._diag_repeat_streak)
+            else:
+                self._diag_repeat_streak = 0
+
+        self._diag_last_call_t = now
+        self._diag_last_raw = raw
+
+        if now - self._diag_last_report_t >= _REMOTE_DIAG_REPORT_INTERVAL_S and self._diag_samples > 0:
+            mean_hz = self._diag_samples / self._diag_dt_sum if self._diag_dt_sum > 0 else float("nan")
+            repeat_pct = 100.0 * self._diag_repeat_count / self._diag_samples
+            logger.info(
+                f"[unitreeRemoteController] rate diag (last {_REMOTE_DIAG_REPORT_INTERVAL_S:.0f}s): "
+                f"parse() called {self._diag_samples + 1} times, mean {mean_hz:.1f} Hz, worst gap "
+                f"{self._diag_dt_max * 1000:.0f} ms, {repeat_pct:.0f}% identical-to-previous-buffer "
+                f"(longest streak {self._diag_max_repeat_streak} calls). A high repeat% while the "
+                "stick is untouched is expected. A high repeat% or long streak WHILE actively moving "
+                "the stick would mean the underlying SDK feed isn't refreshing every tick -- not just "
+                "the control loop running slow."
+            )
+            self._diag_last_report_t = now
+            self._diag_samples = 0
+            self._diag_repeat_count = 0
+            self._diag_max_repeat_streak = 0
+            self._diag_dt_sum = 0.0
+            self._diag_dt_max = 0.0
+
     def _sanitize_axis(self, name: str, value: float) -> float:
         if math.isfinite(value) and abs(value) <= _REMOTE_AXIS_SANITY_BOUND:
             self.last_axes[name] = value
@@ -241,6 +303,8 @@ class unitreeRemoteController:
         return self.last_axes[name]
 
     def parse(self, remoteData):
+        self._update_rate_diagnostic(remoteData)
+
         now = time.time()
         # button
         keys = struct.unpack("H", remoteData[2:4])[0]
