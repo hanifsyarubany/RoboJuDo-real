@@ -261,6 +261,40 @@ magnitude) rather than applied instantly.
 
 ---
 
+# 🎚️ Tuning the commanded speed range (vx / vy / wz)
+
+A full stick push (or held `w`/`a`/`s`/`d`/`q`/`e`) always drives the robot at *some* fixed top
+speed — how fast that is, is one config field: `commands_map` in
+[`g1_unified_loco_kick_policy_cfg.py`](../robojudo/config/g1/policy/g1_unified_loco_kick_policy_cfg.py):
+
+```python
+commands_map: list[list[float]] = [
+    [-0.8, 0.0, 0.8],   # forward/back  (LeftY / w,s)   -- lin_x, m/s
+    [0.5, 0.0, -0.5],   # left/right    (LeftX / a,d)   -- lin_y, m/s
+    [0.8, 0.0, -0.8],   # yaw           (RightX / q,e)  -- ang_z, rad/s
+]
+```
+
+Each row is `[min, mid, max]` for one axis; a full stick deflection in either direction maps
+linearly onto `min`/`max`, centered at `mid` (normally `0.0`). Edit the magnitudes to taste — e.g.
+`[-0.5, 0.0, 0.5]` for a slower, more cautious forward/back range.
+
+**Applies to sim and real identically, no separate tuning needed for each.** The sim gamepad
+(`JoystickCtrl`), the real Unitree remote (`UnitreeCtrl`), and the keyboard (`KeyboardCtrl`) all
+feed into the same `UnifiedLocoKickPolicy._update_velocity_command`, which reads this one field —
+there's no second copy on the real-hardware path to keep in sync.
+
+Two things to keep in mind when retuning:
+- **`lin_y` and `ang_z` are deliberately reversed** (`min > max`, e.g. `[0.5, 0.0, -0.5]`) to match
+  this project's stick-to-command sign convention — change the *magnitudes*, not the ordering. A
+  config-load-time validator rejects a non-monotonic row (neither increasing nor decreasing) so a
+  typo here fails loudly instead of producing a dead or inverted axis.
+- **Stay close to training's `[-1, 1]` command range.** These numbers bound commanded speed, not
+  the policy's own observation scaling — pushing the max magnitudes much past what the checkpoint
+  was trained on will degrade tracking rather than just "go faster."
+
+---
+
 # 🧭 Auto-navigation
 
 Set `G1UnifiedLocoKickPolicyCfg.autonav_enabled = True`, then toggle it live with `n` / LB+Up (starts

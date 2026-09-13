@@ -163,3 +163,24 @@ class G1UnifiedLocoKickPolicyCfg(UnifiedLocoKickPolicyCfg):
     # manual stick/keyboard input instantly cancels it. See UnifiedLocoKickPolicyCfg for the gain
     # knobs (autonav_kp_x/y/yaw) and UnifiedLocoKickPolicy's module docstring for the full design.
     autonav_enabled: bool = True
+
+    # --- locomotion command range: how far a full stick push (or held w/a/s/d/q/e) drives vx/vy/wz ---
+    # Rows are [min, mid, max] for [lin_x m/s (fwd/back), lin_y m/s (left/right), ang_z rad/s (yaw)].
+    # This is THE tunable for "the commanded speed range feels too fast/slow/wide": edit the numbers
+    # below, nothing else. It applies identically to sim and real -- JoystickCtrl (sim gamepad),
+    # UnitreeCtrl (real remote) and KeyboardCtrl all funnel into the same
+    # UnifiedLocoKickPolicy._update_velocity_command, which reads this exact field. No separate
+    # real-hardware copy exists to keep in sync.
+    # Values are currently identical to UnifiedLocoKickPolicyCfg's base default -- this override
+    # exists so operators have a single, obviously-named place to retune G1 without touching the
+    # shared base class (which other robots/policies also read). Stay within training's [-1, 1]
+    # command range (i.e. don't push max magnitudes much past what was trained) or expect degraded
+    # tracking. lin_y and ang_z are deliberately REVERSED (positive stick -> negative command) to
+    # match this project's axis-direction convention -- when tuning, change the min/max MAGNITUDES,
+    # don't "fix" the ordering, and see UnifiedLocoKickPolicyCfg.commands_map's own comment / the
+    # validator there for why reversed rows are intentional and still accepted.
+    commands_map: list[list[float]] = [
+        [-0.8, 0.0, 0.8],  # forward/back  (LeftY / w,s)
+        [0.5, 0.0, -0.5],  # left/right    (LeftX / a,d)
+        [0.8, 0.0, -0.8],  # yaw           (RightX / q,e)
+    ]

@@ -464,12 +464,37 @@ class UnifiedLocoKickPolicyCfg(PolicyCfg):
 
     # controller-normalized-input -> velocity remap, rows [lin_x(fwd), lin_y(lateral), ang_z(yaw)].
     # command_remap maps [-1,0,1] input onto [min,mid,max]. Kept within training's [-1,1] command
-    # range; tune the max magnitudes to taste (they bound commanded speed, not the obs).
+    # range; tune the max magnitudes to taste (they bound commanded speed, not the obs). This is the
+    # ONE place vx/vy/wz range is clamped -- JoystickCtrl (sim), UnitreeCtrl (real) and KeyboardCtrl
+    # all funnel through the same _update_velocity_command, so editing this (or a robot's own
+    # commands_map override, e.g. G1UnifiedLocoKickPolicyCfg) retunes both sim and real identically.
+    # A row's min/mid/max need not be increasing -- lin_y/ang_z below are deliberately reversed
+    # (positive stick -> negative command) to match this project's axis-direction convention; the
+    # validator below only requires each row be strictly monotonic, not increasing.
     commands_map: list[list[float]] = [
         [-0.8, 0.0, 0.8],  # forward/back  (LeftY / w,s)
         [0.5, 0.0, -0.5],  # left/right    (LeftX / a,d)
         [0.8, 0.0, -0.8],  # yaw           (RightX / q,e)
     ]
+
+    @field_validator("commands_map")
+    @classmethod
+    def _check_commands_map(cls, v: list[list[float]]) -> list[list[float]]:
+        axis_names = ["lin_x (fwd/back)", "lin_y (left/right)", "ang_z (yaw)"]
+        if len(v) != 3:
+            raise ValueError(f"commands_map must have exactly 3 rows [lin_x, lin_y, ang_z], got {len(v)}")
+        for name, row in zip(axis_names, v):
+            if len(row) != 3:
+                raise ValueError(f"commands_map row '{name}' must be [min, mid, max], got {row}")
+            lo, mid, hi = row
+            increasing = lo < mid < hi
+            decreasing = lo > mid > hi
+            if not (increasing or decreasing):
+                raise ValueError(
+                    f"commands_map row '{name}' = {row} is not strictly monotonic -- "
+                    "min/mid/max must be either increasing or decreasing"
+                )
+        return v
 
     # Seconds for the applied command to ramp from 0 to each axis's max magnitude when
     # ACCELERATING, rather than stepping there in a single tick. A raw instant step is
