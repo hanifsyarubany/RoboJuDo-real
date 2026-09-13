@@ -593,6 +593,45 @@ class UnifiedLocoKickPolicyCfg(PolicyCfg):
     skill_cycle_gesture_elbow_amp_rad: float = 0.45  # left_elbow swing amplitude, in phase
     skill_cycle_gesture_swings: float = 1.0  # full sine periods within the window (1.0 = one there-and-back)
 
+    # --- hip-roll drift correction (gentle pd_target pull-back during sustained strafe/turn) ---
+    # Deployment-side mitigation for a real, measured checkpoint characteristic (2026-09-13
+    # investigation, see UnifiedLocoKickPolicy's module docstring / _apply_hip_roll_correction's
+    # own docstring for the full story): holding a CONTINUOUS non-zero lin_y/ang_z command for many
+    # seconds lets hip_roll slowly drift and stance width grow past nominal (the training-time
+    # standing-width guard is deliberately faded out any time a command is active, "so it never
+    # fights stride-width variation while walking" -- correct for the gait, but nothing else bounds
+    # the drift while it's faded). This is the SECOND mitigation attempt at this problem --
+    # lateral_cooldown_* (above the autonav section) was the first, and an A/B MuJoCo comparison
+    # showed it measurably WORSE, because reaching genuine zero necessarily crosses
+    # _update_phase's is_standing boundary, retriggering a separate, already-documented gait-
+    # phase-reset instability (see lateral_cooldown_enabled's own comment for the full story).
+    # THIS approach avoids that failure mode BY CONSTRUCTION: it is a pure pd_target overlay on
+    # hip_roll (same category as ready_gesture/skill_cycle_gesture) that never touches
+    # lin_vel_command/ang_vel_command/_smoothed_cmd at all, so it cannot cross is_standing or
+    # retrigger that lurch.
+    #
+    # VERIFIED IN SIM (2026-09-13, A/B MuJoCo, 7-skill checkpoint, 15s sustained strafe/yaw at
+    # these default gain/deadband/max values): genuine improvement, not just "no worse" -- strafe's
+    # end-of-hold hip_roll_R drift went from -6.3deg to -4.6deg, stance width end 0.292m to 0.285m,
+    # yaw's hip_roll_R -4.1deg to -3.0deg, forward -3.7deg to -2.9deg -- with base_z_min UNCHANGED
+    # (0.725m either way, no falls, no new destabilization introduced). Still UNVALIDATED ON REAL
+    # HARDWARE -- sim2sim improvement is a strong signal, not a substitute for testing there, and
+    # the gain/deadband/max values are a reasonable starting point from this one measurement, not a
+    # tuned optimum. Default False: zero behavior change until explicitly opted into.
+    hip_roll_correction_enabled: bool = False
+    # radians of hip_roll deviation from this checkpoint's OWN natural resting value (a baseline
+    # re-captured every tick self.is_standing is True -- NOT literal zero / default_dof_pos, since
+    # this checkpoint's natural standing hip_roll is measurably nonzero, ~-2.6 to -3.2deg on the
+    # right leg even at rest) beyond which the correction engages. Below this, normal gait/stride
+    # variation is left alone.
+    hip_roll_correction_deadband_rad: float = 0.05  # ~2.9 deg
+    # proportional gain: pd_target offset (rad) subtracted per rad of deviation beyond the
+    # deadband, before the max_rad clamp below.
+    hip_roll_correction_gain: float = 0.5
+    # hard cap on the corrective pd_target offset magnitude, regardless of how large the measured
+    # deviation gets -- a safety ceiling, not the normal operating point.
+    hip_roll_correction_max_rad: float = 0.15  # ~8.6 deg
+
     # --- manual kick_aim_theta override (operator dials aim from THIS process's own controller) ---
     # When ENABLED, kick_target_pos_b is computed INTERNALLY every tick as [kick_aim_theta /
     # kick_aim_theta_ref_deg, 0.0] from an operator-held angle the controller nudges -- instead of
@@ -640,3 +679,55 @@ class UnifiedLocoKickPolicyCfg(PolicyCfg):
     # "manual override" -- avoids false-cancelling auto-nav from stick center-noise/drift. Keyboard
     # has no equivalent (w/a/s/d/q/e are discrete press/release, never noisy).
     autonav_manual_deadzone: float = 0.05
+
+    # --- lateral/yaw cooldown: periodic wait-for-zero-then-dwell during a long strafe/turn hold ---
+    # Deployment-side mitigation for a real, measured checkpoint characteristic (2026-09-13
+    # investigation, see UnifiedLocoKickPolicy's module docstring and _apply_lateral_cooldown's own
+    # docstring for the full story): holding a CONTINUOUS non-zero lin_y and/or ang_z command for
+    # many seconds lets hip_roll slowly drift and stance width grow past nominal -- confirmed in
+    # MuJoCo sim2sim over a 15s hold, comparably across multiple checkpoints from this training
+    # lineage (NOT specific to one checkpoint), with real hardware reportedly showing a more
+    # visible version of the same tendency ("legs splitting") than the idealized sim contact model
+    # does. Root cause is the training-time standing-width guard being DELIBERATELY faded out by
+    # an exponential gate on total command magnitude any time a command is active, with nothing
+    # else bounding the drift for as long as it stays faded. When ENABLED, this does not retrain or
+    # patch that guard -- it just gives the policy's OWN already-trained recovery behavior a
+    # repeated chance to re-engage, by forcing lin_y/ang_z's TARGET (NEVER lin_x -- forward alone
+    # did not show this drift in the measurement above) toward zero once a hold runs long enough,
+    # waiting for the ACTUAL applied command to genuinely reach near-zero (not just "commanded to
+    # be zero" -- see lateral_cooldown_dwell_s's own comment for why a fixed-duration pulse was
+    # tried first and measurably failed to do anything), holding there briefly, then resuming
+    # manual input. Manual-input driving only; auto-nav is untouched.
+    #
+    # ⚠️ MEASURED WORSE, NOT BETTER, once actually reaching zero (2026-09-13, A/B MuJoCo, 7-skill
+    # checkpoint, 15s sustained strafe/yaw): width/hip_roll drift and base-height dip were ALL
+    # worse with this ON than OFF. Root cause: reaching genuine near-zero necessarily crosses
+    # `_update_phase`'s `is_standing` boundary, and _compute_autonav_cmd's own docstring (this same
+    # file) already documents that repeatedly crossing that boundary "force-resets the gait phase
+    # mid-settle -- observed to cascade into the robot lurching... by tens of cm." Every cooldown
+    # cycle deliberately manufactures exactly that transition (once going in, once coming back out)
+    # -- this mitigation fixes a slow drift by repeatedly re-triggering a WORSE, already-documented
+    # instability elsewhere in this same policy. Do not enable without addressing that interaction
+    # first (e.g. a version that dwells WITHOUT crossing zero_cmd_eps, or an active pd_target
+    # overlay that never touches the commanded velocity at all, unlike this one). Kept in the
+    # codebase disabled, tested, and documented rather than deleted -- the underlying drift this
+    # was built to fix is still real, just not fixed by this particular approach. Default False:
+    # zero behavior change unless explicitly (and, given the above, inadvisably) enabled.
+    lateral_cooldown_enabled: bool = False
+    # |lin_y| or |ang_z| above this counts as "actively straffing/turning" for the hold-timer --
+    # same spirit as autonav_manual_deadzone, keeps residual stick noise from ever starting a hold.
+    lateral_cooldown_speed_threshold: float = 0.05
+    # seconds of CONTINUOUS lin_y/ang_z above the threshold before a cooldown triggers. Resets to 0
+    # the instant the operator's own command drops back below the threshold on its own -- this is
+    # a ceiling on sustained-hold duration, not a fixed metronome independent of what's held.
+    lateral_cooldown_hold_s: float = 5.0
+    # once triggered, lin_y/ang_z's target is forced to 0 and held there UNTIL the actual applied
+    # command (self._smoothed_cmd) is within zero_cmd_eps of zero -- that wait is NOT this field,
+    # and takes as long as the existing command_decel_time ramp needs (a first version of this
+    # feature used a fixed-duration pulse INSTEAD of waiting for real convergence: caught by an A/B
+    # MuJoCo comparison showing byte-identical results with the mitigation on vs off, because the
+    # 0.4s pulse was shorter than the 1.0s command_decel_time default -- the command never actually
+    # reached zero before forcing stopped, so the standing guard never got a real chance to
+    # re-engage). This field is the ADDITIONAL dwell time held at genuine near-zero once convergence
+    # is confirmed, before resuming manual input -- the actual "let the guard work" window.
+    lateral_cooldown_dwell_s: float = 0.5

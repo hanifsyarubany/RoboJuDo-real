@@ -84,6 +84,14 @@ def _make_policy(
     autonav_manual_deadzone=0.05,
     kick_entry_decel_enabled=False,
     kick_entry_settle_s=0.5,
+    lateral_cooldown_enabled=False,
+    lateral_cooldown_speed_threshold=0.05,
+    lateral_cooldown_hold_s=5.0,
+    lateral_cooldown_dwell_s=0.5,
+    hip_roll_correction_enabled=False,
+    hip_roll_correction_deadband_rad=0.05,
+    hip_roll_correction_gain=0.5,
+    hip_roll_correction_max_rad=0.15,
 ) -> UnifiedLocoKickPolicy:
     p = object.__new__(UnifiedLocoKickPolicy)
     p.session = _FakeSession(ref_quat_table)
@@ -143,6 +151,18 @@ def _make_policy(
     # decel-then-fire kick entry attrs normally set in __init__ (bypassed here by object.__new__)
     p._kick_entry_decel_enabled = kick_entry_decel_enabled
     p._kick_entry_settle_ticks = max(1, int(round(kick_entry_settle_s * p.freq)))
+    # lateral/yaw cooldown attrs normally set in __init__ (bypassed here by object.__new__)
+    p._lateral_cooldown_enabled = lateral_cooldown_enabled
+    p._lateral_cooldown_speed_threshold = lateral_cooldown_speed_threshold
+    p._lateral_cooldown_hold_ticks = max(1, int(round(lateral_cooldown_hold_s * p.freq)))
+    p._lateral_cooldown_dwell_ticks = max(1, int(round(lateral_cooldown_dwell_s * p.freq)))
+    # hip-roll drift correction attrs normally set in __init__ (bypassed here by object.__new__)
+    p._hip_roll_correction_enabled = hip_roll_correction_enabled
+    p._hip_roll_correction_deadband_rad = hip_roll_correction_deadband_rad
+    p._hip_roll_correction_gain = hip_roll_correction_gain
+    p._hip_roll_correction_max_rad = hip_roll_correction_max_rad
+    p._left_hip_roll_idx = 1  # left_hip_roll_joint in the standard G1 dof order
+    p._right_hip_roll_idx = 7  # right_hip_roll_joint
     p.reset()
     p._ready_gesture_user_on = ready_gesture_user_on  # reset() sets it False; override after
     return p
@@ -1028,6 +1048,207 @@ class TestAutoNav(unittest.TestCase):
         ctrl_data = {"KeyboardCtrl": {"keyboard_event": [{"type": "keyboard", "name": "w", "pressed": True}]}}
         p._update_velocity_command(ctrl_data, None)
         self.assertGreater(p.lin_vel_command[0], 0.0)
+
+
+class TestLateralCooldown(unittest.TestCase):
+    """lateral_cooldown_enabled: periodically forces manual_cmd's lin_y/ang_z (NEVER lin_x) toward
+    zero during a long CONTINUOUS strafe/turn hold, then resumes tracking manual input -- a
+    deployment-side mitigation for the measured hip_roll/stance-width drift under sustained
+    lateral/yaw command (2026-09-13, see _apply_lateral_cooldown's own docstring for the full
+    mechanism). Manual-input driving only -- never forces auto-nav's own command."""
+
+    def _p(self, **kw):
+        kw.setdefault("lateral_cooldown_enabled", True)
+        kw.setdefault("lateral_cooldown_hold_s", 0.1)  # 5 ticks @50Hz -- keeps tests short
+        kw.setdefault("lateral_cooldown_dwell_s", 0.06)  # 3 ticks @50Hz
+        return _make_policy([0], [], {0.0: _identity_quat()}, **kw)
+
+    @staticmethod
+    def _joystick(left_x=0.0, left_y=0.0, right_x=0.0):
+        return {"JoystickCtrl": {"axes": {"LeftX": left_x, "LeftY": left_y, "RightX": right_x}}}
+
+    def test_disabled_by_default_never_forces_even_after_a_long_hold(self):
+        p = _make_policy([0], [], {0.0: _identity_quat()})  # lateral_cooldown_enabled=False default
+        ctrl = self._joystick(left_x=-1.0)  # sustained strafe (lin_y=+0.5)
+        for _ in range(500):
+            p._update_velocity_command(ctrl, None)
+        self.assertAlmostEqual(p.lin_vel_command[1], 0.5, places=6, msg="disabled must never force a pulse")
+
+    def test_sustained_strafe_triggers_a_repeating_pulse(self):
+        # hold=5 ticks, dwell=3 ticks. The fixture's rate limit is effectively infinite (see
+        # _make_policy's own comment), so _smoothed_cmd converges to 0 in exactly 1 tick once
+        # forced -- that 1 convergence tick + 3 dwell ticks = 4 forced ticks per cycle, not 3;
+        # a slower rate limit (e.g. the real checkpoint's) would need MORE forced ticks to
+        # converge before the same 3-tick dwell starts counting down -- see
+        # _apply_lateral_cooldown's docstring for why waiting for real convergence, not a fixed
+        # duration, is the point.
+        p = self._p()
+        ctrl = self._joystick(left_x=-1.0)
+        forced = []
+        for _ in range(14):
+            p._update_velocity_command(ctrl, None)
+            forced.append(p.lin_vel_command[1] == 0.0)
+        self.assertEqual(
+            forced,
+            [False, False, False, False, True, True, True, True, False, False, False, False, True, True],
+        )
+
+    def test_yaw_alone_also_triggers_the_cooldown(self):
+        p = self._p()  # see test_sustained_strafe_triggers_a_repeating_pulse for the tick math
+        ctrl = self._joystick(right_x=1.0)  # pure yaw
+        forced = []
+        for _ in range(14):
+            p._update_velocity_command(ctrl, None)
+            forced.append(p.ang_vel_command == 0.0)
+        self.assertEqual(
+            forced,
+            [False, False, False, False, True, True, True, True, False, False, False, False, True, True],
+        )
+
+    def test_lin_x_is_never_touched_during_the_pulse(self):
+        p = self._p()
+        ctrl = self._joystick(left_x=-1.0, left_y=1.0)  # forward + strafe together
+        saw_pulse = False
+        for _ in range(14):
+            p._update_velocity_command(ctrl, None)
+            if p.lin_vel_command[1] == 0.0:
+                saw_pulse = True
+                self.assertAlmostEqual(
+                    p.lin_vel_command[0], 0.8, places=6, msg="forward command must survive the pulse untouched"
+                )
+        self.assertTrue(saw_pulse, "sanity check: the test must actually exercise a pulse")
+
+    def test_releasing_the_stick_before_hold_resets_the_timer(self):
+        p = self._p()  # hold=5 ticks
+        ctrl_on = self._joystick(left_x=-1.0)
+        ctrl_off = self._joystick(left_x=0.0)
+        for _ in range(3):
+            p._update_velocity_command(ctrl_on, None)
+        p._update_velocity_command(ctrl_off, None)  # release before reaching the 5-tick hold
+        for _ in range(4):
+            p._update_velocity_command(ctrl_on, None)
+            self.assertNotEqual(p.lin_vel_command[1], 0.0, "must not fire -- the release should reset the timer")
+
+    def test_autonav_driving_is_never_forced(self):
+        p = self._p(autonav_enabled=True, skill_ball_xy=[[1.0, 0.0]], skill_ball_halfwidth_xy=[[0.1, 0.1]])
+        p._autonav_user_on = True
+        ball = np.array([1.5, 0.2, 0.11])  # well outside the box -- autonav commands nonzero lin_y
+        for _ in range(60):  # settle the gap-EMA persistence gate, same pattern as TestAutoNav._settle
+            p._update_velocity_command(self._joystick(), ball)
+        self.assertTrue(p._autonav_user_on)
+        self.assertGreater(abs(p.lin_vel_command[1]), 0.0, "autonav's own command must never be force-zeroed")
+        self.assertEqual(p._lateral_active_ticks, 0, "counter must stay reset the whole time autonav drives")
+
+
+class TestHipRollCorrection(unittest.TestCase):
+    """hip_roll_correction_enabled: a pure pd_target overlay (never touches lin_vel_command/
+    ang_vel_command) that nudges hip_roll back toward wherever this checkpoint naturally rests
+    (a baseline re-captured every tick is_standing is True) once it drifts more than
+    hip_roll_correction_deadband_rad away. See _apply_hip_roll_correction's own docstring for why
+    this replaced lateral_cooldown_* as the recommended mitigation -- it structurally cannot cross
+    _update_phase's is_standing boundary."""
+
+    _L, _R = 1, 7  # left_hip_roll_joint / right_hip_roll_joint in the standard G1 dof order
+
+    def _p(self, **kw):
+        kw.setdefault("hip_roll_correction_enabled", True)
+        return _make_policy([0], [], {0.0: _identity_quat()}, **kw)
+
+    def _dof_pos_rel(self, left=0.0, right=0.0):
+        v = np.zeros(29)
+        v[self._L] = left
+        v[self._R] = right
+        return v
+
+    def test_disabled_by_default_is_a_total_noop(self):
+        p = _make_policy([0], [], {0.0: _identity_quat()})  # hip_roll_correction_enabled=False default
+        p._update_hip_roll_baseline(self._dof_pos_rel())  # baseline stays 0
+        out = p._apply_hip_roll_correction(np.zeros(29))
+        np.testing.assert_array_equal(out, 0.0)
+
+    def test_no_correction_within_the_deadband(self):
+        p = self._p(hip_roll_correction_deadband_rad=0.05)
+        p._update_hip_roll_baseline(self._dof_pos_rel())  # baseline = 0 (is_standing default True)
+        p.is_standing = False  # subsequent reads must not re-baseline
+        p._update_hip_roll_baseline(self._dof_pos_rel(right=-0.04))  # within the 0.05 deadband
+        out = p._apply_hip_roll_correction(np.zeros(29))
+        self.assertEqual(out[self._R], 0.0)
+
+    def test_corrects_back_toward_baseline_beyond_the_deadband(self):
+        p = self._p(hip_roll_correction_deadband_rad=0.05, hip_roll_correction_gain=1.0, hip_roll_correction_max_rad=1.0)
+        p._update_hip_roll_baseline(self._dof_pos_rel())  # baseline = 0
+        p.is_standing = False
+        p._update_hip_roll_baseline(self._dof_pos_rel(right=-0.15))  # 0.10 beyond the deadband
+        out = p._apply_hip_roll_correction(np.zeros(29))
+        self.assertAlmostEqual(out[self._R], 0.10, places=6, msg="correction must PULL BACK (positive) from a negative drift")
+        self.assertEqual(out[self._L], 0.0, "the untouched leg must not be corrected")
+
+    def test_positive_drift_is_pulled_negative(self):
+        p = self._p(hip_roll_correction_deadband_rad=0.05, hip_roll_correction_gain=1.0, hip_roll_correction_max_rad=1.0)
+        p._update_hip_roll_baseline(self._dof_pos_rel())
+        p.is_standing = False
+        p._update_hip_roll_baseline(self._dof_pos_rel(left=0.20))  # 0.15 beyond the deadband
+        out = p._apply_hip_roll_correction(np.zeros(29))
+        self.assertAlmostEqual(out[self._L], -0.15, places=6, msg="correction must PULL BACK (negative) from a positive drift")
+
+    def test_correction_is_clamped_at_max_rad(self):
+        p = self._p(hip_roll_correction_deadband_rad=0.05, hip_roll_correction_gain=1.0, hip_roll_correction_max_rad=0.1)
+        p._update_hip_roll_baseline(self._dof_pos_rel())
+        p.is_standing = False
+        p._update_hip_roll_baseline(self._dof_pos_rel(right=-1.0))  # huge drift
+        out = p._apply_hip_roll_correction(np.zeros(29))
+        self.assertAlmostEqual(out[self._R], 0.1, places=6, msg="must clamp at hip_roll_correction_max_rad")
+
+    def test_corrects_relative_to_baseline_not_absolute_zero(self):
+        # this checkpoint's own natural resting hip_roll is NOT zero -- the correction must target
+        # DRIFT AWAY FROM that baseline, not fight the baseline itself.
+        p = self._p(hip_roll_correction_deadband_rad=0.05, hip_roll_correction_gain=1.0, hip_roll_correction_max_rad=1.0)
+        p.is_standing = True  # reset() defaults False -- must be standing to CAPTURE a baseline
+        p._update_hip_roll_baseline(self._dof_pos_rel(right=-0.20))  # -> baseline=-0.20
+        self.assertEqual(p._hip_roll_baseline_r, -0.20)
+        p.is_standing = False
+        # still AT the baseline value -- must NOT be corrected even though it's far from literal 0
+        out = p._apply_hip_roll_correction(np.zeros(29))
+        self.assertEqual(out[self._R], 0.0, "sitting exactly at its own baseline must not be corrected")
+        # now drift 0.15 further past baseline (-0.35 vs baseline -0.20) -- 0.10 beyond the deadband
+        p._update_hip_roll_baseline(self._dof_pos_rel(right=-0.35))
+        out = p._apply_hip_roll_correction(np.zeros(29))
+        self.assertAlmostEqual(out[self._R], 0.10, places=6, msg="only the EXCESS beyond the deadband, relative to baseline, should be corrected")
+
+    def test_baseline_recaptures_every_tick_is_standing_is_true(self):
+        p = self._p()
+        p.is_standing = True  # reset() defaults False
+        p._update_hip_roll_baseline(self._dof_pos_rel(right=-0.20))  # standing -> baseline=-0.20
+        self.assertEqual(p._hip_roll_baseline_r, -0.20)
+        p._update_hip_roll_baseline(self._dof_pos_rel(right=-0.05))  # still standing -> re-baselines
+        self.assertEqual(p._hip_roll_baseline_r, -0.05)
+
+    def test_does_not_engage_in_kick_mode(self):
+        p = self._p(hip_roll_correction_gain=1.0, hip_roll_correction_max_rad=1.0)
+        p._update_hip_roll_baseline(self._dof_pos_rel())
+        p.is_standing = False
+        p._update_hip_roll_baseline(self._dof_pos_rel(right=-0.5))
+        p.task_mode = _TASK_KICK
+        out = p._apply_hip_roll_correction(np.zeros(29))
+        self.assertEqual(out[self._R], 0.0)
+
+    def test_missing_hip_roll_joints_gracefully_noop(self):
+        p = self._p()
+        p._left_hip_roll_idx = p._right_hip_roll_idx = None
+        p._update_hip_roll_baseline(self._dof_pos_rel(right=-0.5))  # must not raise / no-op
+        out = p._apply_hip_roll_correction(np.zeros(29))
+        np.testing.assert_array_equal(out, 0.0)
+
+    def test_never_touches_any_other_joint_index(self):
+        p = self._p(hip_roll_correction_gain=1.0, hip_roll_correction_max_rad=1.0)
+        p._update_hip_roll_baseline(self._dof_pos_rel())
+        p.is_standing = False
+        p._update_hip_roll_baseline(self._dof_pos_rel(left=0.5, right=-0.5))
+        base = np.arange(29, dtype=np.float64)  # distinctive nonzero value per index
+        out = p._apply_hip_roll_correction(base.copy())
+        untouched = np.ones(29, dtype=bool)
+        untouched[[self._L, self._R]] = False
+        np.testing.assert_array_equal(out[untouched], base[untouched])
 
 
 class TestKickEntryDecel(unittest.TestCase):

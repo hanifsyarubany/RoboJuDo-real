@@ -134,6 +134,31 @@ box for good -- a several-tick blip barely moves the filtered value, but a multi
 it within about one time constant, same as the raw signal would. Reset to 0 every time the ball is
 confirmed back inside the box, so a stale filtered value from a past excursion never biases the next
 one. See `_compute_autonav_cmd`.
+
+Stance-width drift under sustained strafe/turn (2026-09-13): a real robot deployment reported the
+legs occasionally "splitting" specifically during strafe/rotate, not forward walking. Traced to
+`holosoma`'s own `penalty_stand_feet_width` reward term, whose docstring documents this exact prior
+failure ("feet slide OUTWARD... reaching a 1.04m stance and falling") -- that guard (and its sibling
+`penalty_stance_asymmetry`) is DELIBERATELY faded by an exponential gate on total command magnitude
+any time a command is active, "so it never fights stride-width variation while walking," leaving
+nothing bounding the drift for as long as a command stays nonzero. A direct MuJoCo A/B measurement
+(15s sustained holds, both a 4-skill and a 7-skill checkpoint) did NOT reproduce the dramatic
+1.04m/fall failure, but DID show a real, reproducible, checkpoint-family-wide (not one-checkpoint-
+specific) pattern: strafe (not yaw) is where stance width actually grows (~+3cm/15s), and hip_roll
+(especially the right leg) drifts progressively under every active command, worst under strafe.
+
+Two mitigations were tried; only the SECOND is safe to enable. `lateral_cooldown_*` (periodically
+forcing lin_y/ang_z toward genuine zero, then resuming) was tried FIRST and is a KNOWN BAD IDEA --
+reaching genuine zero necessarily crosses `_update_phase`'s `is_standing` boundary, which this
+docstring's own Auto-navigation section above already documents as force-resetting the gait phase
+and cascading into a lurch when crossed repeatedly. An A/B MuJoCo re-test with `lateral_cooldown_*`
+correctly implemented (waiting for real convergence, not a broken fixed-duration pulse) confirmed it
+measurably WORSENS width/hip_roll/base-height versus doing nothing -- kept in the codebase,
+disabled, documented with the failure, not deleted. `hip_roll_correction_*` (a pure pd_target
+overlay nudging hip_roll toward its own resting baseline once it drifts past a deadband -- see
+`_apply_hip_roll_correction`) is the approach actually recommended, BY CONSTRUCTION: it never
+touches `lin_vel_command`/`ang_vel_command`/`_smoothed_cmd`, so it cannot cross `is_standing` and
+cannot retrigger that lurch. Both opt-in, both default False.
 """
 
 from __future__ import annotations
@@ -378,6 +403,22 @@ class UnifiedLocoKickPolicy(Policy):
                     "left_elbow_joint are not in dof_names -- skill-cycled gesture disabled."
                 )
 
+        # ---- hip-roll drift correction (see _apply_hip_roll_correction) ----
+        self._hip_roll_correction_enabled = bool(cfg_policy.hip_roll_correction_enabled)
+        self._hip_roll_correction_deadband_rad = float(cfg_policy.hip_roll_correction_deadband_rad)
+        self._hip_roll_correction_gain = float(cfg_policy.hip_roll_correction_gain)
+        self._hip_roll_correction_max_rad = float(cfg_policy.hip_roll_correction_max_rad)
+        try:
+            self._left_hip_roll_idx = dof_names.index("left_hip_roll_joint")
+            self._right_hip_roll_idx = dof_names.index("right_hip_roll_joint")
+        except ValueError:
+            self._left_hip_roll_idx = self._right_hip_roll_idx = None
+            if self._hip_roll_correction_enabled:
+                logger.warning(
+                    "[UnifiedLocoKick] hip_roll_correction_enabled but left_hip_roll_joint/"
+                    "right_hip_roll_joint are not in dof_names -- hip-roll correction disabled."
+                )
+
         # ---- auto-navigation (see _compute_autonav_cmd) ----
         self._autonav_enabled = bool(cfg_policy.autonav_enabled)
         self._autonav_kp_approach = float(cfg_policy.autonav_kp_approach)
@@ -432,6 +473,12 @@ class UnifiedLocoKickPolicy(Policy):
         self._kick_entry_decel_enabled = cfg_policy.kick_entry_decel_enabled
         self._kick_entry_settle_ticks = max(1, int(round(cfg_policy.kick_entry_settle_s * self.freq)))
 
+        # ---- lateral/yaw cooldown (see policy_cfgs.py's own field comment) ----
+        self._lateral_cooldown_enabled = cfg_policy.lateral_cooldown_enabled
+        self._lateral_cooldown_speed_threshold = cfg_policy.lateral_cooldown_speed_threshold
+        self._lateral_cooldown_hold_ticks = max(1, int(round(cfg_policy.lateral_cooldown_hold_s * self.freq)))
+        self._lateral_cooldown_dwell_ticks = max(1, int(round(cfg_policy.lateral_cooldown_dwell_s * self.freq)))
+
         self.reset()
 
     # ------------------------------------------------------------------ #
@@ -483,6 +530,13 @@ class UnifiedLocoKickPolicy(Policy):
         # one-shot "skill cycled" left-arm wave (see _start/_apply_skill_cycle_gesture)
         self._skill_cycle_gesture_ticks_left = 0  # >0 while the wave is playing; counts down to 0
         self._skill_cycle_gesture_total_ticks = 0  # window length captured when the wave was armed
+        # hip-roll drift correction (see _apply_hip_roll_correction) -- baseline is CAPTURED fresh
+        # every time is_standing goes True, so this corrects DRIFT AWAY from wherever this
+        # checkpoint naturally rests, not a fight against its own baseline standing asymmetry.
+        self._hip_roll_baseline_l = 0.0
+        self._hip_roll_baseline_r = 0.0
+        self._last_hip_roll_l = 0.0
+        self._last_hip_roll_r = 0.0
         # manual kick_aim_theta override (see _nudge/_reset_manual_kick_aim_theta); degrees, held
         # across kicks/returns like _selected_skill_id (an operator dials this in ahead of a kick).
         self._manual_kick_aim_theta_deg = 0.0
@@ -492,6 +546,14 @@ class UnifiedLocoKickPolicy(Policy):
         # low-pass filtered box-gap (see _compute_autonav_cmd) -- persistence gate for whether a
         # departure from the box is "real" (correct it) or noise/settling (ignore it either way).
         self._autonav_gap_ema = 0.0
+        # lateral/yaw cooldown (see _apply_lateral_cooldown's own docstring) -- counts ticks of
+        # CONTINUOUS manual lin_y/ang_z command above lateral_cooldown_speed_threshold; once it
+        # reaches _lateral_cooldown_hold_ticks, forces lin_y/ang_z (lin_x untouched) toward zero
+        # until the ACTUAL applied command reaches near-zero, holds for _lateral_cooldown_dwell_
+        # ticks more, then resumes tracking manual input.
+        self._lateral_active_ticks = 0
+        self._lateral_cooldown_active = False
+        self._lateral_cooldown_dwell_ticks_left = 0
         # warm the ONNX once so a frame-0 clip value exists before the first real obs
         self._prime_clip()
 
@@ -585,6 +647,11 @@ class UnifiedLocoKickPolicy(Policy):
             self._autonav_user_on = False
             logger.info("[UnifiedLocoKick] auto-nav CANCELLED -- manual locomotion input detected")
 
+        # Lateral/yaw cooldown (see policy_cfgs.py's own field comment): manual_cmd may get its
+        # lin_y/ang_z components forced to 0 here for a brief pulse -- lin_x and manual_active
+        # itself (computed above, from the RAW input) are untouched either way.
+        manual_cmd = self._apply_lateral_cooldown(manual_cmd)
+
         cmd = self._compute_autonav_cmd(ball_pos_b) if self._autonav_user_on else manual_cmd
 
         # Decel-then-fire kick entry (see policy_cfgs.py's own field comment): a pending kick
@@ -609,6 +676,85 @@ class UnifiedLocoKickPolicy(Policy):
         self._smoothed_cmd = np.where(snap, 0.0, self._smoothed_cmd)
         self.lin_vel_command = self._smoothed_cmd[:2].copy()
         self.ang_vel_command = float(self._smoothed_cmd[2])
+
+    def _apply_lateral_cooldown(self, manual_cmd: np.ndarray) -> np.ndarray:
+        """Deployment-side mitigation for a real, measured checkpoint characteristic: holding a
+        CONTINUOUS non-zero lin_y (strafe) and/or ang_z (yaw) command for many seconds lets
+        hip_roll slowly drift and the feet spread wider than nominal -- confirmed in MuJoCo
+        sim2sim over a 15s sustained hold, comparably on multiple checkpoints from this training
+        lineage, so this is a property of the trained gait, not a bug in the remap/rate-limiter
+        above. Root cause: the training-time reward that keeps stance width nominal
+        (``penalty_stand_feet_width`` / ``penalty_stance_asymmetry``) is DELIBERATELY faded out by
+        an exponential gate on total command magnitude any time a command is active ("so it never
+        fights stride-width variation while walking") -- correct for not fighting the gait, but it
+        means the guard stays mostly off for as long as lin_y/ang_z stays nonzero, with nothing
+        else bounding the drift during that whole time.
+
+        Mitigation: force lin_y/ang_z's TARGET (NEVER lin_x -- forward alone did not show this
+        drift) toward zero once a hold has run long enough, then -- critically -- keep forcing it
+        until the ACTUAL applied ``_smoothed_cmd`` has genuinely reached near-zero (not just
+        "commanded to be zero"), hold there for a further dwell period, and only then resume
+        tracking manual input. This doesn't invent a new recovery behavior -- it just gives the
+        policy's OWN already-trained standing guard a repeated chance to re-engage once the robot
+        is genuinely near-standing, the same way it already does every time a real operator's
+        command naturally passes through zero.
+
+        Why "wait for genuinely near-zero" instead of a fixed-duration pulse (an earlier version of
+        this method, caught by an A/B MuJoCo comparison before shipping): the EXISTING rate
+        limiter's decel time (``command_decel_time``, 1.0s default) can easily exceed a short fixed
+        pulse -- a 0.4s pulse against a 1.0s decel-to-zero never actually reaches zero before
+        forcing stops, so the standing guard never meaningfully re-engages and the whole mitigation
+        is a no-op in practice. Tying release to the ACTUAL command value (via ``zero_cmd_eps``,
+        the same threshold the gait-phase standing detection already uses) makes this correct
+        regardless of how command_decel_time/command_ramp_time happen to be tuned.
+
+        Manual-input driving only (skipped entirely while auto-nav drives) -- see
+        ``UnifiedLocoKickPolicyCfg.lateral_cooldown_*`` for the tunable thresholds/durations, and
+        this class's module docstring for the measured drift numbers this was sized against.
+        No-op unless ``lateral_cooldown_enabled``.
+
+        ⚠️ MEASURED WORSE, NOT BETTER, once this actually reaches zero (2026-09-13 A/B MuJoCo,
+        7-skill checkpoint): reaching genuine near-zero necessarily crosses ``_update_phase``'s
+        ``is_standing`` boundary, which ``_compute_autonav_cmd``'s own docstring in this same file
+        already documents as force-resetting the gait phase mid-settle and cascading into a lurch.
+        Every cooldown cycle manufactures exactly that crossing, twice (once going in, once coming
+        back out) -- see ``lateral_cooldown_enabled``'s own cfg comment for the measured numbers.
+        Not recommended for use as currently designed.
+        """
+        if not self._lateral_cooldown_enabled or self._autonav_user_on:
+            self._lateral_active_ticks = 0
+            self._lateral_cooldown_active = False
+            self._lateral_cooldown_dwell_ticks_left = 0
+            return manual_cmd
+
+        if self._lateral_cooldown_active:
+            manual_cmd = manual_cmd.copy()
+            manual_cmd[1] = 0.0
+            manual_cmd[2] = 0.0
+            at_zero = (
+                abs(self._smoothed_cmd[1]) < self.zero_cmd_eps and abs(self._smoothed_cmd[2]) < self.zero_cmd_eps
+            )
+            if at_zero:
+                self._lateral_cooldown_dwell_ticks_left -= 1
+                if self._lateral_cooldown_dwell_ticks_left <= 0:
+                    self._lateral_cooldown_active = False
+            return manual_cmd
+
+        lateral_speed = max(abs(manual_cmd[1]), abs(manual_cmd[2]))
+        if lateral_speed > self._lateral_cooldown_speed_threshold:
+            self._lateral_active_ticks += 1
+        else:
+            self._lateral_active_ticks = 0
+
+        if self._lateral_active_ticks >= self._lateral_cooldown_hold_ticks:
+            self._lateral_active_ticks = 0
+            self._lateral_cooldown_active = True
+            self._lateral_cooldown_dwell_ticks_left = self._lateral_cooldown_dwell_ticks
+            manual_cmd = manual_cmd.copy()
+            manual_cmd[1] = 0.0
+            manual_cmd[2] = 0.0
+
+        return manual_cmd
 
     def _compute_autonav_cmd(self, ball_pos_b: np.ndarray | None) -> np.ndarray:
         """[lin_x, lin_y, ang_z] target command that homes the robot onto the CURRENTLY SELECTED
@@ -1008,6 +1154,56 @@ class UnifiedLocoKickPolicy(Policy):
         out[self._left_elbow_idx] += self._skill_cycle_gesture_elbow_amp_rad * osc
         return out
 
+    def _update_hip_roll_baseline(self, dof_pos_rel: np.ndarray) -> None:
+        """Cache the current hip_roll dof_pos (relative to default_dof_pos) for
+        _apply_hip_roll_correction, and re-capture the baseline every tick self.is_standing is
+        True. Called every get_observation, regardless of whether the correction is enabled, so
+        toggling it on mid-run always has a fresh, non-stale baseline (cheap: two float reads)."""
+        if self._left_hip_roll_idx is None:
+            return
+        self._last_hip_roll_l = float(dof_pos_rel[self._left_hip_roll_idx])
+        self._last_hip_roll_r = float(dof_pos_rel[self._right_hip_roll_idx])
+        if self.is_standing:
+            self._hip_roll_baseline_l = self._last_hip_roll_l
+            self._hip_roll_baseline_r = self._last_hip_roll_r
+
+    def _apply_hip_roll_correction(self, scaled_action: np.ndarray) -> np.ndarray:
+        """Gently pull hip_roll's pd_target back toward wherever this checkpoint naturally rests
+        (``_hip_roll_baseline_l/r``, see ``_update_hip_roll_baseline``) once it has drifted more
+        than ``hip_roll_correction_deadband_rad`` away, clamped to
+        ``hip_roll_correction_max_rad``. Deployment-side mitigation for a real, measured drift
+        under sustained strafe/turn commands (see this class's module docstring and
+        UnifiedLocoKickPolicyCfg's own field comment) -- an ALTERNATIVE to the (measurably
+        counter-productive) lateral_cooldown_* approach above: this NEVER touches
+        lin_vel_command/ang_vel_command/_smoothed_cmd, so it structurally cannot cross
+        _update_phase's is_standing boundary or retrigger that gait-phase-reset lurch. Pure
+        pd_target overlay, same category as _apply_ready_gesture/_apply_skill_cycle_gesture --
+        never stashed into self.last_action, so the policy never 'sees' or compensates for it.
+        Correcting toward a BASELINE (not toward 0 / default_dof_pos directly) matters: this
+        checkpoint's own natural standing hip_roll is NOT zero (measured ~-2.6 to -3.2deg on the
+        right leg even at rest with zero command) -- correcting against literal zero would fight
+        that normal resting asymmetry instead of just the excess drift under active driving.
+        Locomotion-mode only (never mid-kick, matching the other two overlays). No-op unless
+        ``hip_roll_correction_enabled``."""
+        if not self._hip_roll_correction_enabled or self._left_hip_roll_idx is None:
+            return scaled_action
+        if self.task_mode != _TASK_LOCOMOTION:
+            return scaled_action
+
+        out = np.asarray(scaled_action, dtype=np.float64).copy()
+        for idx, measured, baseline in (
+            (self._left_hip_roll_idx, self._last_hip_roll_l, self._hip_roll_baseline_l),
+            (self._right_hip_roll_idx, self._last_hip_roll_r, self._hip_roll_baseline_r),
+        ):
+            deviation = measured - baseline
+            if deviation > self._hip_roll_correction_deadband_rad:
+                excess = deviation - self._hip_roll_correction_deadband_rad
+                out[idx] -= min(self._hip_roll_correction_gain * excess, self._hip_roll_correction_max_rad)
+            elif deviation < -self._hip_roll_correction_deadband_rad:
+                excess = deviation + self._hip_roll_correction_deadband_rad  # negative
+                out[idx] -= max(self._hip_roll_correction_gain * excess, -self._hip_roll_correction_max_rad)
+        return out
+
     def get_observation(self, env_data, ctrl_data):
         # ball_pos_b resolved FIRST -- _update_velocity_command needs it for auto-nav (see its
         # docstring); this reorder is a no-op for everything else, _resolve_ball_and_target is a
@@ -1018,6 +1214,7 @@ class UnifiedLocoKickPolicy(Policy):
         self._update_ready_gesture_state(ball_pos_b)
 
         dof_pos_rel = env_data.dof_pos - self.default_dof_pos
+        self._update_hip_roll_baseline(dof_pos_rel)
         dof_vel = env_data.dof_vel
         base_ang_vel = env_data.base_ang_vel
         base_quat_xyzw = env_data.base_quat  # RoboJuDo: w-last
@@ -1058,11 +1255,13 @@ class UnifiedLocoKickPolicy(Policy):
         self.motion_command_t = np.concatenate([np.asarray(outs[1]).squeeze(), np.asarray(outs[2]).squeeze()])
         self.ref_quat_xyzw_t = np.asarray(outs[3]).squeeze()
 
-        # arm overlays: readiness gesture (right arm) then skill-cycled wave (left arm) -- disjoint
-        # joints, pure pd_target offsets, neither stashed into self.last_action.
+        # overlays: readiness gesture (right arm), skill-cycled wave (left arm), hip-roll drift
+        # correction (both hips) -- all disjoint joints, pure pd_target offsets, none stashed into
+        # self.last_action.
         scaled = actions * self.per_joint_action_scale
         scaled = self._apply_ready_gesture(scaled)
         scaled = self._apply_skill_cycle_gesture(scaled)
+        scaled = self._apply_hip_roll_correction(scaled)
         return scaled
 
     # ------------------------------------------------------------------ #

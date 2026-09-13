@@ -184,3 +184,26 @@ class G1UnifiedLocoKickPolicyCfg(UnifiedLocoKickPolicyCfg):
         [0.5, 0.0, -0.5],  # left/right    (LeftX / a,d)
         [0.8, 0.0, -0.8],  # yaw           (RightX / q,e)
     ]
+
+    # ⚠️ Leave this False. See UnifiedLocoKickPolicyCfg.lateral_cooldown_enabled's own comment: this
+    # was built to fix a measured hip_roll/stance-width drift under sustained strafe/turn, but an
+    # A/B MuJoCo comparison (2026-09-13) showed it measurably makes that same drift WORSE once
+    # actually working, by repeatedly re-triggering a separate, already-documented instability
+    # (_update_phase's is_standing gait-phase-reset). Kept disabled/tested/documented rather than
+    # deleted, not recommended for use as-is. SUPERSEDED by hip_roll_correction_enabled below.
+    lateral_cooldown_enabled: bool = False
+
+    # The SECOND (and, unlike the one above, actually working) mitigation for the same
+    # sustained-strafe/turn stance-width drift -- a pure pd_target overlay on hip_roll that never
+    # touches the commanded velocity, so it cannot hit lateral_cooldown's is_standing problem.
+    # A/B MuJoCo (2026-09-13, this checkpoint, 15s strafe/yaw) showed a genuine improvement at the
+    # UnifiedLocoKickPolicyCfg defaults (hip_roll_R end-of-hold drift -6.3->-4.6deg under strafe)
+    # with base height unchanged (no new instability). Enabled here (2026-09-13) for BOTH sim2sim
+    # AND real deployment -- this is the one G1UnifiedLocoKickPolicyCfg (DEPLOY_TARGET only swaps
+    # the env class, never the policy cfg), so no separate real-hardware toggle exists or is
+    # needed; the overlay itself is also environment-agnostic by construction (reads env_data.
+    # dof_pos, present identically from MujocoEnv and UnitreeCppEnv). Still only sim-verified as of
+    # this date -- watch real-hardware behavior and set False here if it doesn't hold up there. See
+    # UnifiedLocoKickPolicyCfg's own field comment for the full measurement and the
+    # deadband/gain/max knobs.
+    hip_roll_correction_enabled: bool = True
