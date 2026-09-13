@@ -100,6 +100,18 @@ def command_remap(command, new_range, old_range=None):
 
     old_min, old_mid, old_max = old_range
     new_min, new_mid, new_max = new_range
+
+    # Defense-in-depth against a bad upstream reading (e.g. a corrupted real-remote wireless
+    # packet -- see unitreeRemoteController._sanitize_axis, the primary guard). This is a pure
+    # linear EXTRAPOLATION with no clamp of its own, so an out-of-[old_min,old_max] `command` would
+    # otherwise map straight through to an out-of-[new_min,new_max] velocity command with no
+    # warning. NaN/Inf collapse to old_mid (== "centered/no input", the same value the deadzone
+    # snap below already treats as a no-op) since np.clip alone does not sanitize NaN. Legitimate
+    # callers (joystick axes in [-1,1], keyboard held-state in {-1,0,1}) are always already inside
+    # [old_min, old_max], so this is a no-op for every existing valid input.
+    command = np.nan_to_num(command, nan=old_mid, posinf=old_max, neginf=old_min)
+    command = np.clip(command, min(old_min, old_max), max(old_min, old_max))
+
     if abs((command - old_mid) / (old_max - old_min)) < 0.02:
         return np.full_like(command, new_mid, dtype=np.float32)
 

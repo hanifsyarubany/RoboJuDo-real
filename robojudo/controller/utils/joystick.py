@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 import struct
 import time
@@ -8,6 +9,13 @@ from threading import Thread
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+# Sanity bound for the real remote's raw axis floats -- generously wider than the expected [-1, 1]
+# joystick range (to tolerate normal out-of-calibration sticks), but tight enough to catch garbage
+# from a corrupted wireless packet (RF interference near motors is a real, sim-has-no-equivalent-of
+# condition on this link -- struct.unpack on a bad byte pattern can produce NaN/Inf or huge floats).
+_REMOTE_AXIS_SANITY_BOUND = 1.5
+_REMOTE_AXIS_WARN_INTERVAL_S = 1.0  # rate-limit the invalid-reading warning, don't spam per-tick
 
 os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "hide"
 
@@ -212,6 +220,26 @@ class unitreeRemoteController:
         ]
         self.last_button_state = np.zeros((16), dtype=bool)
 
+        # last-known-good axis readings -- a rejected (NaN/Inf/out-of-range) tick holds the previous
+        # value rather than snapping to 0.0, matching what a real analog stick physically does during
+        # a brief glitch (freezes) instead of injecting an unintended "release to center" transient.
+        self.last_axes = {"LeftX": 0.0, "LeftY": 0.0, "RightX": 0.0, "RightY": 0.0}
+        self._last_axis_warn_t = 0.0
+
+    def _sanitize_axis(self, name: str, value: float) -> float:
+        if math.isfinite(value) and abs(value) <= _REMOTE_AXIS_SANITY_BOUND:
+            self.last_axes[name] = value
+            return value
+        now = time.time()
+        if now - self._last_axis_warn_t >= _REMOTE_AXIS_WARN_INTERVAL_S:
+            self._last_axis_warn_t = now
+            logger.warning(
+                f"[unitreeRemoteController] rejected {name}={value!r} (NaN/Inf or |value| > "
+                f"{_REMOTE_AXIS_SANITY_BOUND}) -- likely a corrupted wireless packet; holding last "
+                f"good value {self.last_axes[name]!r} instead"
+            )
+        return self.last_axes[name]
+
     def parse(self, remoteData):
         now = time.time()
         # button
@@ -233,17 +261,18 @@ class unitreeRemoteController:
                 )
         self.last_button_state = button_state.copy()
 
-        # axis
+        # axis -- unpacked from the raw wireless payload with no transport-level integrity check
+        # available to us (see _sanitize_axis's comment), so every value is validated before use.
         lx_offset = 4
-        LeftX = struct.unpack("<f", remoteData[lx_offset : lx_offset + 4])[0]
+        LeftX = self._sanitize_axis("LeftX", struct.unpack("<f", remoteData[lx_offset : lx_offset + 4])[0])
         rx_offset = 8
-        RightX = struct.unpack("<f", remoteData[rx_offset : rx_offset + 4])[0]
+        RightX = self._sanitize_axis("RightX", struct.unpack("<f", remoteData[rx_offset : rx_offset + 4])[0])
         ry_offset = 12
-        RightY = struct.unpack("<f", remoteData[ry_offset : ry_offset + 4])[0]
+        RightY = self._sanitize_axis("RightY", struct.unpack("<f", remoteData[ry_offset : ry_offset + 4])[0])
         # L2_offset = 16
         # L2 = struct.unpack('<f', remoteData[L2_offset:L2_offset + 4])[0] # Placeholder，unused
         ly_offset = 20
-        LeftY = struct.unpack("<f", remoteData[ly_offset : ly_offset + 4])[0]
+        LeftY = self._sanitize_axis("LeftY", struct.unpack("<f", remoteData[ly_offset : ly_offset + 4])[0])
 
         while self.state_queue.full():
             self.state_queue.get()
