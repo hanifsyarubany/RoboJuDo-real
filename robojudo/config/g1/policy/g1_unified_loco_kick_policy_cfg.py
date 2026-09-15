@@ -90,10 +90,26 @@ from robojudo.tools.tool_cfgs import DoFConfig
 #     "UnifiedBallKickingEnhanced/20260901_115721-stageC-skill012-h074-locomotion/model_0390000.onnx"
 # )
 
+# DEFAULT_ONNX_PATH = (
+#     "/workspaces/isaaclab_arena/submodules/workspaces/playground/unified_ball_kick_enhanced/logs/"
+#     "UnifiedBallKickingEnhanced/20260907_100900-distill-7skills-12161718192011-distill/model_0440000.onnx"
+# )
+
+# DEFAULT_ONNX_PATH = (
+#     "/workspaces/isaaclab_arena/submodules/workspaces/playground/unified_ball_kick_enhanced/logs/"
+#     "UnifiedBallKickingEnhanced/20260827_044801-stageB-skill012-h074-locomotion/model_0250000.onnx"
+# )
+
 DEFAULT_ONNX_PATH = (
     "/workspaces/isaaclab_arena/submodules/workspaces/playground/unified_ball_kick_enhanced/logs/"
-    "UnifiedBallKickingEnhanced/20260907_100900-distill-7skills-12161718192011-distill/model_0440000.onnx"
+    "UnifiedBallKickingEnhanced/20260914_211052-stageC-skill018-h074-locomotion/model_0351000.onnx"
 )
+
+DEFAULT_ONNX_PATH = (
+    "/workspaces/isaaclab_arena/submodules/workspaces/playground/unified_ball_kick_enhanced/logs/"
+    "LocomotionAndBallKicking/20260915_002653-unified-stageA-locomotion-height-074-locomotion/model_0020000.onnx"
+)
+
 
 
 
@@ -206,4 +222,28 @@ class G1UnifiedLocoKickPolicyCfg(UnifiedLocoKickPolicyCfg):
     # this date -- watch real-hardware behavior and set False here if it doesn't hold up there. See
     # UnifiedLocoKickPolicyCfg's own field comment for the full measurement and the
     # deadband/gain/max knobs.
-    hip_roll_correction_enabled: bool = True
+    # hip_roll_correction_enabled: bool = True
+
+    # # Tuned tighter than UnifiedLocoKickPolicyCfg's defaults (0.05/0.5/0.15), per a second A/B
+    # # sweep (2026-09-14) run specifically at LOW foot<->floor friction (0.3 and 0.2, vs the sim
+    # # default 0.8 -- see the friction_sweep finding above) since that's the regime the real report
+    # # ("feet visibly slide, stance width becomes high") actually lives in, not the easy 0.8 default.
+    # # Result was friction-dependent, not a uniform win -- both sides matter for how to read this:
+    # #   - At MODERATE friction shortfall (0.3, right at the trained low edge): monotonic
+    # #     improvement on BOTH stance width AND actual foot slip going tighter deadband/higher gain
+    # #     -- e.g. strafe slip 5.08/7.08 (off) -> 2.50/4.35 (old defaults) -> 2.01/3.26mm/tick
+    # #     (these values). Genuine win, no downside observed.
+    # #   - At SEVERE friction shortfall (0.2, below the trained range): correction (either these
+    # #     values or the old defaults) is what keeps a yaw hold from an outright FALL (fell=True,
+    # #     base height collapsed to 0.436m, with correction OFF) -- a real safety benefit -- but does
+    # #     NOT reduce the visible slip itself at this severity (slip mm/tick came back flat-to-
+    # #     slightly-worse than the old defaults, e.g. yaw 10.22/9.82 vs 10.27/8.78), because by this
+    # #     point the foot is sliding regardless of what the hip is commanded to do -- pulling harder
+    # #     just means fighting a losing contact-friction battle, not fixing it.
+    # # Net: real, measured improvement to keep, but NOT a substitute for the actual friction/floor
+    # # fix if your real floor sits in the severe regime -- see the friction_sweep finding and this
+    # # class's own module docstring for the full context. UNVALIDATED ON REAL HARDWARE, same caveat
+    # # as hip_roll_correction_enabled itself.
+    # hip_roll_correction_deadband_rad: float = 0.0
+    # hip_roll_correction_gain: float = 0.8
+    # hip_roll_correction_max_rad: float = 0.2

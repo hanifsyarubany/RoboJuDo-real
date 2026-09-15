@@ -39,6 +39,19 @@ class MujocoEnvCfg(EnvCfg):
     random_heading: bool = False
     """Randomize the robot's yaw heading on each spawn/reborn (useful for testing heading alignment)."""
 
+    foot_floor_friction: float | None = None
+    """Override every foot<->floor MuJoCo contact pair's friction coefficient (both tangential
+    components) at load time -- None (default) leaves the scene XML's own baked-in value
+    untouched. Applied by matching every contact <pair> that involves the geom named "floor" (the
+    scene XML's own naming convention, see e.g. scene_g1_29dof.xml's comment), so this works for
+    any robot's scene without needing to know its specific foot-geom names. Exists because the G1
+    holosoma scene fixes this at a single value (0.8) sitting comfortably in the safe middle of a
+    typical trained friction-randomization range (e.g. [0.3, 1.6] for the unified_ball_kick_
+    enhanced checkpoints) -- a stock sim2sim run never tests anywhere near that range's edges, so a
+    checkpoint that looks fine in sim can still be right at (or past) its trained limit on a real,
+    lower-friction floor. Set this to reproduce that on demand rather than guessing from a report
+    of "feet visibly sliding" on real hardware."""
+
 
 class RobotEnvCfg(EnvCfg):
     env_type: str = "DummyEnv"

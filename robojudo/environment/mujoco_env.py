@@ -28,6 +28,8 @@ class MujocoEnv(Environment):
 
         self.model = mujoco.MjModel.from_xml_path(cfg_env.xml)  # pyright: ignore[reportAttributeAccessIssue]
         self.model.opt.timestep = self.sim_dt
+        if cfg_env.foot_floor_friction is not None:
+            self._override_foot_floor_friction(cfg_env.foot_floor_friction)
         self.data = mujoco.MjData(self.model)  # pyright: ignore[reportAttributeAccessIssue]
         # mujoco.mj_resetDataKeyframe(self.model, self.data, 0)
         mujoco.mj_step(self.model, self.data)  # pyright: ignore[reportAttributeAccessIssue]
@@ -60,6 +62,28 @@ class MujocoEnv(Environment):
         self._guard_ramp = None  # set by guard_stop(), consumed each step() by _apply_guard_ramp()
 
         self.update()  # get initial state
+
+    def _override_foot_floor_friction(self, value: float) -> None:
+        """See MujocoEnvCfg.foot_floor_friction's own docstring. Matches by the "floor" geom name
+        rather than a foot-geom naming convention, so this works regardless of which robot's scene
+        is loaded -- every contact <pair> touching "floor" is, by construction, a foot<->floor
+        pair in these scenes (see e.g. scene_g1_29dof.xml's own comment on why the floor geom is
+        named that). Sets both tangential friction components (pair_friction columns 0-1); leaves
+        torsional/rolling friction (columns 2-4) untouched."""
+        floor_gid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "floor")  # pyright: ignore[reportAttributeAccessIssue]
+        if floor_gid < 0:
+            logger.warning(
+                f"[MujocoEnv] foot_floor_friction={value} set but no geom named 'floor' exists in "
+                f"this scene -- ignored, friction left at whatever the XML specifies."
+            )
+            return
+        n = 0
+        for pid in range(self.model.npair):
+            if self.model.pair_geom1[pid] == floor_gid or self.model.pair_geom2[pid] == floor_gid:
+                self.model.pair_friction[pid, 0] = value
+                self.model.pair_friction[pid, 1] = value
+                n += 1
+        logger.warning(f"[MujocoEnv] foot_floor_friction override: set friction={value} on {n} floor contact pairs")
 
     def _apply_random_heading(self):
         """Rotate the root body by a random yaw if random_heading is enabled."""

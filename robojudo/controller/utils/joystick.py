@@ -3,7 +3,7 @@ import math
 import os
 import struct
 import time
-from queue import Empty, Queue
+from queue import Empty, Full, Queue
 from threading import Thread
 
 import numpy as np
@@ -17,9 +17,42 @@ logger = logging.getLogger(__name__)
 _REMOTE_AXIS_SANITY_BOUND = 1.5
 _REMOTE_AXIS_WARN_INTERVAL_S = 1.0  # rate-limit the invalid-reading warning, don't spam per-tick
 
+# > this many of the 16 raw button bits changing in a single sample is implausible for a human
+# press (multi-button combos elsewhere in this codebase top out at 3, e.g. ctrl_cfgs.py's
+# "L1+R1+A" test trigger) and much more likely the same kind of corrupted wireless packet the axes
+# already guard against above -- the button word had NO such validation until this was added.
+_REMOTE_BUTTON_MAX_PLAUSIBLE_FLIPS = 6
+
 _REMOTE_DIAG_REPORT_INTERVAL_S = 5.0  # how often to log the parse()-rate / repeated-buffer summary
 
 os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "hide"
+
+
+def _put_event_dropping_oldest(event_queue: Queue, event: dict, who: str) -> None:
+    """put() a button/dpad event, dropping the OLDEST queued one instead of blocking if full.
+
+    event_queue.put() used to have no fullness guard at all here -- unlike this module's axes
+    state_queue (which already drains-before-put, see both callers below) -- so a burst of button
+    events (e.g. from a corrupted wireless packet flipping several bits of the same 16-bit word at
+    once, see _REMOTE_BUTTON_MAX_PLAUSIBLE_FLIPS) could fill the bounded queue and then block
+    .put() indefinitely. For UnitreeCtrl that queue is a multiprocessing.Queue and parse() runs
+    SYNCHRONOUSLY on the main control-loop thread (see unitree_cpp_env.py's update()), so that
+    block freezes the entire robot, not just button handling -- diagnosed after a real ~45s
+    control-loop freeze on 2026-09-15. Dropping an old button event is far safer than that.
+    """
+    dropped = False
+    while True:
+        try:
+            event_queue.put_nowait(event)
+            break
+        except Full:
+            dropped = True
+            try:
+                event_queue.get_nowait()
+            except Empty:
+                pass  # raced with the consumer draining it in the meantime -- just retry the put
+    if dropped:
+        logger.warning(f"[{who}] event_queue was full -- dropped the oldest queued button event")
 
 
 # TODO: axis post processing
@@ -136,13 +169,15 @@ class JoystickThread(Thread):
                 if event.type == pygame.JOYBUTTONDOWN or event.type == pygame.JOYBUTTONUP:
                     btn_index = event.button
                     btn_name = button_map.get(btn_index, f"Button_{btn_index}")
-                    self.event_queue.put(
+                    _put_event_dropping_oldest(
+                        self.event_queue,
                         {
                             "type": "button",
                             "name": btn_name,
                             "pressed": event.type == pygame.JOYBUTTONDOWN,
                             "timestamp": now,
-                        }
+                        },
+                        "JoystickThread",
                     )
 
                 elif event.type == pygame.JOYHATMOTION:
@@ -154,21 +189,25 @@ class JoystickThread(Thread):
                         for name, pressed in dpad_state_new.items():
                             if pressed != dpad_state[name]:
                                 dpad_state[name] = pressed
-                                self.event_queue.put(
+                                _put_event_dropping_oldest(
+                                    self.event_queue,
                                     {
                                         "type": "button",
                                         "name": name,
                                         "pressed": pressed,
                                         "timestamp": now,
-                                    }
+                                    },
+                                    "JoystickThread",
                                 )
                     else:
-                        self.event_queue.put(
+                        _put_event_dropping_oldest(
+                            self.event_queue,
                             {
                                 "type": "dpad",
                                 "value": event.value,
                                 "timestamp": now,
-                            }
+                            },
+                            "JoystickThread",
                         )
 
             # Axes update at fixed rate
@@ -227,6 +266,7 @@ class unitreeRemoteController:
         # a brief glitch (freezes) instead of injecting an unintended "release to center" transient.
         self.last_axes = {"LeftX": 0.0, "LeftY": 0.0, "RightX": 0.0, "RightY": 0.0}
         self._last_axis_warn_t = 0.0
+        self._last_button_warn_t = 0.0
 
         # --- update-rate / staleness diagnostic (log-only, changes no behavior) ---
         # Answers "how often does parse() actually get called, and is it ever handed the exact
@@ -313,15 +353,35 @@ class unitreeRemoteController:
 
         # Check for button state changes
         changed = button_state != self.last_button_state
+        n_changed = int(np.count_nonzero(changed))
+        if n_changed > _REMOTE_BUTTON_MAX_PLAUSIBLE_FLIPS:
+            # Unlike the axes (_sanitize_axis), the raw 16-bit button word had NO corruption check
+            # until now -- a garbled wireless packet can flip many bits at once relative to
+            # last_button_state, which used to enqueue one spurious button event per flipped bit
+            # (see _put_event_dropping_oldest's docstring for what a burst of those could do
+            # downstream). Treat the whole packet as suspect and hold the last known-good button
+            # state, exactly like a rejected axis reading -- skip event_queue, last_button_state,
+            # AND the axis/state_queue update below for this call, since a corrupted button word
+            # means the rest of the same buffer is suspect too.
+            if now - self._last_button_warn_t >= _REMOTE_AXIS_WARN_INTERVAL_S:
+                self._last_button_warn_t = now
+                logger.warning(
+                    f"[unitreeRemoteController] rejected button word 0x{keys:04x} ({n_changed} of "
+                    f"16 bits changed at once, > {_REMOTE_BUTTON_MAX_PLAUSIBLE_FLIPS}) -- likely a "
+                    "corrupted wireless packet; holding last button state instead"
+                )
+            return
         for i in range(16):
             if changed[i]:
-                self.event_queue.put(
+                _put_event_dropping_oldest(
+                    self.event_queue,
                     {
                         "type": "button",
                         "name": self.button_map[i],
                         "pressed": bool(button_state[i]),
                         "timestamp": now,
-                    }
+                    },
+                    "unitreeRemoteController",
                 )
         self.last_button_state = button_state.copy()
 

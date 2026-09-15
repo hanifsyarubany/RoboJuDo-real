@@ -6,6 +6,7 @@ if platform.machine().startswith("aarch64"):
     os.environ["OMP_NUM_THREADS"] = "1"
 
 import argparse
+import faulthandler
 import json
 import logging
 import time
@@ -191,6 +192,33 @@ def parse_args():
         "degrees to be meaningful; this process has no way to know if the checkpoint actually uses "
         "kick_aim_enabled, so the shown value is only correct when that's true. Default 45.0 matches "
         "this project's own MultiSkillConfig/BallConfig.kick_aim_theta_ref_deg default.",
+    )
+    parser.add_argument(
+        "--sim-foot-floor-friction",
+        type=float,
+        default=None,
+        help="SIM ONLY (raises at startup if the config isn't a sim env). Overrides every foot<->"
+        "floor MuJoCo contact pair's friction coefficient -- the scene's own XML "
+        "(scene_g1_29dof.xml) fixes this at a single value (0.8), comfortably in the safe middle "
+        "of the checkpoint's own trained friction-randomization range ([0.3, 1.6] static / "
+        "[0.3, 1.2] dynamic, per its embedded experiment_config), so a stock sim2sim run never "
+        "exercises anything near the low end. Use this to test at a specific point in (or below) "
+        "that trained range -- e.g. --sim-foot-floor-friction 0.3 for the trained low edge, or "
+        "lower to probe how a real, lower-friction floor might behave, matching a real-hardware "
+        "'feet visibly sliding' report before assuming it's a checkpoint/policy bug. Default None: "
+        "leaves the XML's baked-in 0.8 untouched, zero behavior change.",
+    )
+    parser.add_argument(
+        "--stall-watchdog-s",
+        type=float,
+        default=2.0,
+        help="Diagnostic safety net for the main loop: if a single tick blocks longer than this "
+        "many seconds, faulthandler dumps every thread's Python stack to "
+        "'robojudo_stall_watchdog_pid<PID>.log' in the current directory -- pinpointing exactly "
+        "where the process was stuck, instead of only learning it happened after the fact from the "
+        "'excessive frame drop' shutdown. Added after a real ~45s full-process freeze on real "
+        "hardware (2026-09-15) that no log line could explain on its own. Re-armed every tick, so "
+        "it only ever fires on a genuine stall, never on normal operation. Set to 0 to disable.",
     )
     args = parser.parse_args()
     return args
@@ -437,6 +465,13 @@ def main():
 
     cfg: RlPipelineCfg = config_manager.get_cfg()
 
+    if args.sim_foot_floor_friction is not None:
+        if not cfg.env.is_sim:
+            raise SystemExit("--sim-foot-floor-friction only applies to a sim config (cfg.env.is_sim=False here).")
+        cfg.env.foot_floor_friction = args.sim_foot_floor_friction
+        logger.warning(f"[sim2sim] overriding foot<->floor friction to {args.sim_foot_floor_friction} "
+                       "(scene default is 0.8) -- see --sim-foot-floor-friction's own help for why.")
+
     robot_pose_redis_client = None
     if args.live_ball:
         if args.ball_source == "redis":
@@ -569,7 +604,23 @@ def main():
     _robot_pose_publish_failing = False  # throttle: warn once per failure streak, not every tick
     _last_ball_log_t = 0.0
 
+    _stall_watchdog_file = None
+    if args.stall_watchdog_s > 0:
+        stall_watchdog_path = f"robojudo_stall_watchdog_pid{os.getpid()}.log"
+        _stall_watchdog_file = open(stall_watchdog_path, "a")
+        logger.warning(
+            f"[stall-watchdog] armed at {args.stall_watchdog_s:.1f}s -- any single tick blocking "
+            f"longer than that dumps every thread's stack to {stall_watchdog_path!r}. Disable with "
+            "--stall-watchdog-s 0."
+        )
+
     while True:
+        if _stall_watchdog_file is not None:
+            # Re-arm every tick (cancel + re-set), i.e. "pet" the watchdog -- a normal tick always
+            # beats the deadline and disarms it before it can fire, so a dump only ever happens if
+            # THIS tick is the one that's actually stuck, and it captures that exact frozen stack.
+            faulthandler.cancel_dump_traceback_later()
+            faulthandler.dump_traceback_later(args.stall_watchdog_s, file=_stall_watchdog_file)
         time_start = time.time()
         pipeline.step(dry_run=args.dry_run)
         if safety_monitor is not None:
@@ -630,6 +681,11 @@ def main():
                     logger.error(f"Warning: frame drop -> {time_diff}")
                     if time_diff < -0.2:
                         logger.critical("Exiting due to excessive frame drop")
+                        if _stall_watchdog_file is not None:
+                            # Disarm before the intentional 10s sleep below -- otherwise the
+                            # watchdog would fire again on that sleep itself and log a misleading
+                            # "stall" for what's actually a deliberate shutdown pause.
+                            faulthandler.cancel_dump_traceback_later()
                         pipeline.env.shutdown()
                         time.sleep(10)
                         break

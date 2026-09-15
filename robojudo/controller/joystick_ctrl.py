@@ -75,7 +75,13 @@ class JoystickCtrl(Controller):
         if len(self.triggers) == 0:
             return ctrl_data, commands
 
+        # Build the surviving-events list instead of ctrl_data["button_event"].remove(event) inside
+        # the loop below -- removing from a list while iterating it shifts later indices under the
+        # iterator, silently skipping whichever event landed right after the removed one in the same
+        # batch (e.g. a combo's second button event, if both arrived in one get_events() call).
+        remaining_events = []
         for event in ctrl_data["button_event"]:
+            consumed = False
             if event["type"] == "button":
                 if event["name"] in self.combination_init_buttons:
                     if event["pressed"]:
@@ -92,9 +98,11 @@ class JoystickCtrl(Controller):
                             command = self.triggers.get(event_combination, None)
                         if command is not None:
                             commands.append(command)
-                            # remove event after triggered
-                            ctrl_data["button_event"].remove(event)
+                            consumed = True  # matched a trigger -- drop it, same as the old .remove(event)
+            if not consumed:
+                remaining_events.append(event)
 
+        ctrl_data["button_event"] = remaining_events
         return ctrl_data, commands
 
 
