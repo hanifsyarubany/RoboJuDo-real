@@ -9,6 +9,7 @@ import argparse
 import faulthandler
 import json
 import logging
+import sys
 import time
 
 import numpy as np
@@ -258,21 +259,28 @@ def parse_args():
         "--guard-arm-kp",
         type=float,
         default=None,
-        help="Override guard_pose.GUARD_ARM_KP (class default 20.0) -- how firmly guard_stop()'s "
-        "arms are driven toward the overhead guard pose. Patches the name as already bound in "
-        "environment.mujoco_env (and environment.unitree_cpp_env, if that real-hardware SDK is "
-        "installed) -- see this flag's own implementation comment for why a plain guard_pose.py "
-        "attribute assignment wouldn't reach either. Applies on sim AND real. Raise this if the arms "
-        "aren't winning against an ongoing fall/disturbance (default is deliberately weak -- see "
-        "guard_pose.py's own comment on why). Default None: leaves the module default untouched.",
+        help="Override GUARD_ARM_KP (guard_pose.py default 20.0) -- how firmly guard_stop()'s arms "
+        "are driven toward the overhead guard pose. Applies on sim AND REAL: it patches the name as "
+        "bound in whichever env module this run actually uses, and hard-exits rather than starting "
+        "if it can't (see the implementation comment for why a plain guard_pose.py assignment "
+        "wouldn't reach it). Raise this if the arms don't reach the pose when the stop is hit while "
+        "they're already moving fast -- measured in sim (scripts/, 2026-09-18): firing a guard stop "
+        "mid-kick-strike, the worst arm joint reached only ~36%% of the way to the target at the "
+        "default 20, ~65%% at 40, ~85%% at 80, ~93%% at 150. THE DEFAULT IS DELIBERATELY WEAK: 20 is "
+        "the G1's stock WRIST stiffness, chosen so an arm that meets the ground or an obstruction "
+        "mid-guard doesn't transmit full trained-controller force (guard_pose.py's own comment). "
+        "Raising it trades that protection for pose fidelity -- 40 is the stock shoulder/elbow "
+        "value, 150 is ~3.75x it. Sim PD is idealized; real actuators may saturate first. "
+        "Default None: leaves guard_pose.py's default untouched.",
     )
     parser.add_argument(
         "--guard-arm-kd",
         type=float,
         default=None,
-        help="Override guard_pose.GUARD_ARM_KD (class default 2.0) -- damping paired with "
-        "--guard-arm-kp. Same patch mechanism, same sim/real scope. Default None: leaves the module "
-        "default untouched.",
+        help="Override GUARD_ARM_KD (guard_pose.py default 2.0) -- damping paired with "
+        "--guard-arm-kp; raise it alongside kp (the sim sweep above used kd ~= kp/10) so a stiffer "
+        "arm doesn't just oscillate about the target. Same patch mechanism and same sim/real scope "
+        "as --guard-arm-kp. Default None: leaves guard_pose.py's default untouched.",
     )
     parser.add_argument(
         "--guard-stop-arm-ramp-s",
@@ -690,29 +698,32 @@ def main():
         pipeline.SAFETY_CHECK_KICK_TILT_RAD = new_rad
 
     if args.guard_arm_kp is not None or args.guard_arm_kd is not None:
-        # GUARD_ARM_KP/KD are read as bare names inside mujoco_env.py/unitree_cpp_env.py's
-        # _apply_guard_ramp(), bound into EACH of those modules' own namespaces at their own
+        # GUARD_ARM_KP/KD are read as bare module-level names inside the env's own
+        # _apply_guard_ramp(), bound into that module's namespace by its
         # `from ...guard_pose import GUARD_ARM_KD, GUARD_ARM_KP, ...` line -- reassigning
-        # guard_pose.GUARD_ARM_KP itself afterward would NOT reach either module's already-bound
-        # copy (a `from x import y` binds a snapshot, not a live reference back to x). So patch the
-        # attribute on each consuming module directly instead.
-        from robojudo.environment import mujoco_env as _mujoco_env_mod
-
-        _patch_targets = [_mujoco_env_mod]
-        try:
-            from robojudo.environment import unitree_cpp_env as _unitree_cpp_env_mod
-
-            _patch_targets.append(_unitree_cpp_env_mod)
-        except ImportError:
-            pass  # real-hardware SDK not installed here (e.g. this dev container) -- sim-only patch
-
-        for _mod in _patch_targets:
-            if args.guard_arm_kp is not None:
-                logger.warning(f"[tune] {_mod.__name__}.GUARD_ARM_KP: {_mod.GUARD_ARM_KP:.1f} -> {args.guard_arm_kp:.1f}")
-                _mod.GUARD_ARM_KP = args.guard_arm_kp
-            if args.guard_arm_kd is not None:
-                logger.warning(f"[tune] {_mod.__name__}.GUARD_ARM_KD: {_mod.GUARD_ARM_KD:.1f} -> {args.guard_arm_kd:.1f}")
-                _mod.GUARD_ARM_KD = args.guard_arm_kd
+        # guard_pose.GUARD_ARM_KP itself would NOT reach that already-bound copy (`from x import y`
+        # binds a snapshot, not a live reference back to x). So patch the module that defines THIS
+        # run's env class, resolved from the live object rather than from a hardcoded module list:
+        # that is exactly the namespace _apply_guard_ramp() reads, whether this run is MujocoEnv
+        # (sim) or UnitreeCppEnv (real hardware). Resolving it this way also means the real-hardware
+        # path can't silently go unpatched the way a "try to import unitree_cpp_env, shrug on
+        # ImportError" list could -- a gain that quietly stays at its default is worse than no flag
+        # at all here, so a missing attribute is a hard exit below, not a warning.
+        _env_mod = sys.modules[type(pipeline.env).__module__]
+        for _flag, _name, _value in (
+            ("--guard-arm-kp", "GUARD_ARM_KP", args.guard_arm_kp),
+            ("--guard-arm-kd", "GUARD_ARM_KD", args.guard_arm_kd),
+        ):
+            if _value is None:
+                continue
+            if not hasattr(_env_mod, _name):
+                raise SystemExit(
+                    f"{_flag} cannot be applied: {_env_mod.__name__} (env type "
+                    f"{type(pipeline.env).__name__}) has no {_name} to override. Refusing to start "
+                    "rather than run a guard stop with the gain silently left at its default."
+                )
+            logger.warning(f"[tune] {_env_mod.__name__}.{_name}: {getattr(_env_mod, _name):.1f} -> {_value:.1f}")
+            setattr(_env_mod, _name, _value)
 
     ball_ctrl_inst = None
     ball_ctrl_type = None
