@@ -360,7 +360,15 @@ class g1_unified_loco_kick(RlPipelineCfg):
     ctrl: list = _make_ctrl()
     policy: G1UnifiedLocoKickPolicyCfg = G1UnifiedLocoKickPolicyCfg()
 
-    do_safety_check: bool = DEPLOY_TARGET == "real"
+    # OFF everywhere (2026-09-18, operator decision), was `DEPLOY_TARGET == "real"`. The automatic
+    # IMU-tilt fall detector (RlPipeline.safety_check() -> guard_stop() on real) no longer runs on
+    # hardware: stopping the robot is the operator's call via the manual triggers ([SHUTDOWN] Esc/A,
+    # [GUARD_STOP] 'g'/remote Start, [SOFT_STOP] 'i'), not an auto-dispatch whose thresholds were
+    # only ever tuned in sim (see scripts/measure_fall_tilt.py and safety_check()'s own comment for
+    # what that tuning did and did not establish). Nothing is deleted -- safety_check() and both
+    # tilt thresholds still exist and are still CLI-tunable; set this True (or use
+    # run_pipeline_prepared.py's --sim-test-real-safety-check in sim) to exercise it again.
+    do_safety_check: bool = False
 
 
 @cfg_registry.register
@@ -393,4 +401,4 @@ class g1_unified_loco_kick_amo(RlMultiPolicyPipelineCfg):
         G1UnifiedLocoKickPolicyCfg(),
     ]
 
-    do_safety_check: bool = DEPLOY_TARGET == "real"
+    do_safety_check: bool = False  # OFF everywhere -- see g1_unified_loco_kick's own comment above

@@ -223,9 +223,10 @@ class RlLocoMimicPipeline(RlMultiPolicyPipeline):
 
         for command in commands:
             match command:
-                case "[SHUTDOWN]":
-                    logger.warning("Emergency shutdown!")
-                    self.env.shutdown()
+                # Same single guard-pose stop every other pipeline now uses (operator decision,
+                # 2026-09-18) -- see RlPipeline.stop_with_guard_pose()'s docstring.
+                case "[SHUTDOWN]" | "[SOFT_STOP]" | "[GUARD_STOP]" | "[ESTOP]" | "[ESTOP_SLOW]" | "[ESTOP_REAL]":
+                    self.stop_with_guard_pose(command)
                 case "[SIM_REBORN]":
                     if hasattr(self.env, "reborn"):
                         logger.warning("Simulation Env reborn!")

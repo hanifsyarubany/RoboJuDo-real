@@ -123,9 +123,13 @@ class RlMultiPolicyPipeline(RlPipeline):
         commands = ctrl_data.get("COMMANDS", [])
         for command in commands:
             match command:
-                case "[SHUTDOWN]":
-                    logger.warning("Emergency shutdown!")
-                    self.env.shutdown()
+                # All stop commands route to RlPipeline.stop_with_guard_pose() (operator decision,
+                # 2026-09-18) -- see its docstring. [SOFT_STOP]/[GUARD_STOP]/[ESTOP*] are listed
+                # here too because this pipeline never handled them at all: the configs bind those
+                # keys (see g1_unified_loco_kick_cfg.py), so on this pipeline they used to be
+                # silently dropped rather than stopping anything.
+                case "[SHUTDOWN]" | "[SOFT_STOP]" | "[GUARD_STOP]" | "[ESTOP]" | "[ESTOP_SLOW]" | "[ESTOP_REAL]":
+                    self.stop_with_guard_pose(command)
                 case "[SIM_REBORN]":
                     if hasattr(self.env, "reborn"):
                         logger.warning("Simulation Env reborn!")

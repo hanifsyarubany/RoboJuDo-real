@@ -32,6 +32,15 @@ import mujoco  # noqa: E402 -- see note above; must come after robojudo.pipeline
 
 logger = logging.getLogger("robojudo")
 
+# --sim-test-real-safety-check: force-induced fall timing/magnitude. PUSH_FORCE/PUSH_DURATION match
+# scripts/measure_fall_tilt.py's own validated "definitely induces a fall" shove (900N far exceeds
+# training's body_push_force_max=80N, so this is deliberately unrealistic-but-reliable, not meant to
+# resemble a real push -- it only needs to reliably tip the robot over so guard_stop()'s dispatch is
+# actually exercised).
+DEFAULT_TEST_PUSH_DELAY_S = 3.0
+TEST_PUSH_FORCE_N = 900.0
+TEST_PUSH_DURATION_S = 0.15
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -207,6 +216,103 @@ def parse_args():
         "lower to probe how a real, lower-friction floor might behave, matching a real-hardware "
         "'feet visibly sliding' report before assuming it's a checkpoint/policy bug. Default None: "
         "leaves the XML's baked-in 0.8 untouched, zero behavior change.",
+    )
+    parser.add_argument(
+        "--sim-test-real-safety-check",
+        action="store_true",
+        help="SIM ONLY (raises at startup if the config isn't a sim env). Watch RlPipeline."
+        "safety_check()'s REAL-hardware dispatch path end to end in sim, before trusting it on "
+        "hardware -- same 'watch it happen in sim first' rule every other real-hardware-only "
+        "mechanism in this project follows (guard_pose.py, soft_stop(), etc). Does two things: "
+        "(1) forces cfg.do_safety_check=True (a sim config normally leaves this off), and (2) makes "
+        "safety_check() -- and only safety_check() -- see no reborn() on the env, so its own "
+        "hasattr(self.env, 'reborn') check -- which is what makes sim take the auto-recovering "
+        "reborn() branch instead of guard_stop() -- fails and falls through to the SAME guard_stop() "
+        "branch real hardware takes. '`'/[SIM_REBORN] itself still works normally for a manual reset "
+        "between attempts (that dispatch happens earlier in the tick, unaffected). Also applies a "
+        f"scripted lateral shove to the torso {DEFAULT_TEST_PUSH_DELAY_S:.0f}s after the sim reset "
+        "(see --sim-test-push-delay-s) so you don't need a joystick to actually induce a fall.",
+    )
+    parser.add_argument(
+        "--sim-test-push-delay-s",
+        type=float,
+        default=DEFAULT_TEST_PUSH_DELAY_S,
+        help="Only used with --sim-test-real-safety-check. Seconds after the sim reset to "
+        "'default_stand' before the scripted test shove fires.",
+    )
+    parser.add_argument(
+        "--sim-test-push-force-n",
+        type=float,
+        default=TEST_PUSH_FORCE_N,
+        help="Only used with --sim-test-real-safety-check. Magnitude (N) of the scripted lateral "
+        f"test shove. Default ({TEST_PUSH_FORCE_N:.0f}N) is deliberately extreme -- far above "
+        "training's body_push_force_max=80N -- chosen only to GUARANTEE a fall so guard_stop()'s "
+        "dispatch is exercised, not to resemble a realistic disturbance. A push this hard can "
+        "overwhelm GUARD_ARM_KP's weak arm authority before the arms ever reach the guard target "
+        "(observed directly: the ramp's commanded target interpolates correctly, but the actual "
+        "joint barely moves toward it while the robot is still crashing) -- lower this (e.g. 150-300) "
+        "to test guard_stop() against something closer to a real stumble, where the arms may "
+        "actually have time to get there.",
+    )
+    parser.add_argument(
+        "--guard-arm-kp",
+        type=float,
+        default=None,
+        help="Override guard_pose.GUARD_ARM_KP (class default 20.0) -- how firmly guard_stop()'s "
+        "arms are driven toward the overhead guard pose. Patches the name as already bound in "
+        "environment.mujoco_env (and environment.unitree_cpp_env, if that real-hardware SDK is "
+        "installed) -- see this flag's own implementation comment for why a plain guard_pose.py "
+        "attribute assignment wouldn't reach either. Applies on sim AND real. Raise this if the arms "
+        "aren't winning against an ongoing fall/disturbance (default is deliberately weak -- see "
+        "guard_pose.py's own comment on why). Default None: leaves the module default untouched.",
+    )
+    parser.add_argument(
+        "--guard-arm-kd",
+        type=float,
+        default=None,
+        help="Override guard_pose.GUARD_ARM_KD (class default 2.0) -- damping paired with "
+        "--guard-arm-kp. Same patch mechanism, same sim/real scope. Default None: leaves the module "
+        "default untouched.",
+    )
+    parser.add_argument(
+        "--guard-stop-arm-ramp-s",
+        type=float,
+        default=None,
+        help="Override RlPipeline.GUARD_STOP_ARM_RAMP_SECONDS (class default 0.4s) -- how long "
+        "guard_stop()'s arm ramp takes to reach the overhead guard pose once triggered, whether "
+        "manually ([GUARD_STOP]: keyboard 'g' / remote 'Start') or automatically (safety_check() on "
+        "real hardware, or in sim via --sim-test-real-safety-check). Lower = arms brace faster but "
+        "more abruptly (they're moving near the robot's own head); this does NOT change how fast the "
+        "FALL gets detected, only how fast the arms move once it has been. Applies on sim AND real, "
+        "not sim-only. Default None: leaves the class default (0.4s) untouched.",
+    )
+    parser.add_argument(
+        "--safety-check-locomotion-tilt-deg",
+        type=float,
+        default=None,
+        help="Override RlPipeline.SAFETY_CHECK_LOCOMOTION_TILT_RAD (class default ~25.2 deg) -- the "
+        "tilt-angle threshold safety_check() uses to detect a fall while task_mode != 'kick'. Lower "
+        "= detected earlier, but with less margin above normal operation (measured max ~5 deg across "
+        "walk/strafe/yaw/aggressive-combined commands in sim -- see scripts/measure_fall_tilt.py). "
+        "Does NOT affect the kick-mode threshold (--safety-check-kick-tilt-deg) -- a fall that "
+        "happens while task_mode=='kick' is gated by THAT one instead, however low this is set. "
+        "Applies on sim AND real. Default None: leaves the class default untouched.",
+    )
+    parser.add_argument(
+        "--safety-check-kick-tilt-deg",
+        type=float,
+        default=None,
+        help="Override RlPipeline.SAFETY_CHECK_KICK_TILT_RAD (class default ~57.3 deg) -- the "
+        "tilt-angle threshold safety_check() uses to detect a fall while task_mode == 'kick'. Left "
+        "high by default on purpose: a single scripted (ball-less) kick swing reached 58 deg without "
+        "actually falling in this project's own testing (scripts/measure_fall_tilt.py), so a much "
+        "lower value risks guard_stop() firing mid-swing on a legitimate kick, which is itself "
+        "dangerous (killing leg authority and wrenching the arms up mid-kick). ONLY lower this for a "
+        "deliberate test where you specifically want a kick-mode fall to trip early -- e.g. testing "
+        "an OOD ball target that gets the policy stuck in 'kick' task_mode while destabilizing (a "
+        "real failure mode: --safety-check-locomotion-tilt-deg has NO effect for as long as "
+        "task_mode stays 'kick', which it can for the whole fall). Applies on sim AND real. Default "
+        "None: leaves the class default untouched.",
     )
     parser.add_argument(
         "--stall-watchdog-s",
@@ -472,6 +578,18 @@ def main():
         logger.warning(f"[sim2sim] overriding foot<->floor friction to {args.sim_foot_floor_friction} "
                        "(scene default is 0.8) -- see --sim-foot-floor-friction's own help for why.")
 
+    if args.sim_test_real_safety_check:
+        if not cfg.env.is_sim:
+            raise SystemExit("--sim-test-real-safety-check only applies to a sim config (cfg.env.is_sim=False here).")
+        cfg.do_safety_check = True
+        logger.warning(
+            "[sim-test] --sim-test-real-safety-check: forcing do_safety_check=True; once the "
+            "pipeline exists, safety_check() will be wrapped so a detected fall takes the SAME "
+            "guard_stop() dispatch branch real hardware takes ('`'/[SIM_REBORN] itself keeps working "
+            "normally -- see this flag's own --help for why). A scripted test shove fires "
+            f"{args.sim_test_push_delay_s:.0f}s after the sim reset."
+        )
+
     robot_pose_redis_client = None
     if args.live_ball:
         if args.ball_source == "redis":
@@ -542,6 +660,60 @@ def main():
 
     pipeline = pipeline_class(cfg=cfg)
 
+    if args.guard_stop_arm_ramp_s is not None:
+        # Instance-level override -- shadows RlPipeline's class constant for this pipeline only,
+        # standard Python attribute lookup (instance dict before class dict). Both guard_stop()'s
+        # trigger sites (manual [GUARD_STOP] and safety_check()) read self.GUARD_STOP_ARM_RAMP_SECONDS
+        # at call time, so this takes effect immediately, no restart of anything needed.
+        logger.warning(
+            f"[tune] GUARD_STOP_ARM_RAMP_SECONDS: {pipeline.GUARD_STOP_ARM_RAMP_SECONDS:.2f}s -> "
+            f"{args.guard_stop_arm_ramp_s:.2f}s"
+        )
+        pipeline.GUARD_STOP_ARM_RAMP_SECONDS = args.guard_stop_arm_ramp_s
+
+    if args.safety_check_locomotion_tilt_deg is not None:
+        new_rad = float(np.radians(args.safety_check_locomotion_tilt_deg))
+        logger.warning(
+            f"[tune] SAFETY_CHECK_LOCOMOTION_TILT_RAD: {np.degrees(pipeline.SAFETY_CHECK_LOCOMOTION_TILT_RAD):.1f}"
+            f" deg -> {args.safety_check_locomotion_tilt_deg:.1f} deg (kick-mode threshold unchanged)"
+        )
+        pipeline.SAFETY_CHECK_LOCOMOTION_TILT_RAD = new_rad
+
+    if args.safety_check_kick_tilt_deg is not None:
+        new_rad = float(np.radians(args.safety_check_kick_tilt_deg))
+        logger.warning(
+            f"[tune] SAFETY_CHECK_KICK_TILT_RAD: {np.degrees(pipeline.SAFETY_CHECK_KICK_TILT_RAD):.1f}"
+            f" deg -> {args.safety_check_kick_tilt_deg:.1f} deg (locomotion-mode threshold unchanged) "
+            "-- a legitimate kick swing can transiently reach ~58 deg (see this flag's own --help); "
+            "make sure this is a deliberate test, not an accidental setting for normal kicking."
+        )
+        pipeline.SAFETY_CHECK_KICK_TILT_RAD = new_rad
+
+    if args.guard_arm_kp is not None or args.guard_arm_kd is not None:
+        # GUARD_ARM_KP/KD are read as bare names inside mujoco_env.py/unitree_cpp_env.py's
+        # _apply_guard_ramp(), bound into EACH of those modules' own namespaces at their own
+        # `from ...guard_pose import GUARD_ARM_KD, GUARD_ARM_KP, ...` line -- reassigning
+        # guard_pose.GUARD_ARM_KP itself afterward would NOT reach either module's already-bound
+        # copy (a `from x import y` binds a snapshot, not a live reference back to x). So patch the
+        # attribute on each consuming module directly instead.
+        from robojudo.environment import mujoco_env as _mujoco_env_mod
+
+        _patch_targets = [_mujoco_env_mod]
+        try:
+            from robojudo.environment import unitree_cpp_env as _unitree_cpp_env_mod
+
+            _patch_targets.append(_unitree_cpp_env_mod)
+        except ImportError:
+            pass  # real-hardware SDK not installed here (e.g. this dev container) -- sim-only patch
+
+        for _mod in _patch_targets:
+            if args.guard_arm_kp is not None:
+                logger.warning(f"[tune] {_mod.__name__}.GUARD_ARM_KP: {_mod.GUARD_ARM_KP:.1f} -> {args.guard_arm_kp:.1f}")
+                _mod.GUARD_ARM_KP = args.guard_arm_kp
+            if args.guard_arm_kd is not None:
+                logger.warning(f"[tune] {_mod.__name__}.GUARD_ARM_KD: {_mod.GUARD_ARM_KD:.1f} -> {args.guard_arm_kd:.1f}")
+                _mod.GUARD_ARM_KD = args.guard_arm_kd
+
     ball_ctrl_inst = None
     ball_ctrl_type = None
     if args.live_ball and args.ball_log_hz > 0:
@@ -558,6 +730,9 @@ def main():
         logger.warning("=" * 78)
 
     ball_qpos_addr = None
+    test_push_torso_bid = None  # --sim-test-real-safety-check only; None means "not scheduled"
+    test_push_deadline = None
+    test_push_active_until = None
     if cfg.env.is_sim:
         env = pipeline.env
         if mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_KEY, "default_stand") < 0:
@@ -569,6 +744,40 @@ def main():
         mujoco.mj_forward(env.model, env.data)
         env.update()
         logger.warning(f"Sim: reset to 'default_stand' keyframe, base_z={env.data.qpos[2]:.3f}")
+
+        if args.sim_test_real_safety_check:
+            # Make safety_check() -- and ONLY safety_check() -- see no reborn() on the env, so ITS
+            # OWN `hasattr(self.env, "reborn")` dispatch check fails and falls through to the SAME
+            # guard_stop() branch real hardware takes. Scoped to just that one call (hide reborn,
+            # call the real safety_check(), restore reborn) via an instance-level override of
+            # pipeline.safety_check -- Python attribute lookup finds this instance attribute before
+            # RlPipeline's own class method, so post_step_callback()'s `self.safety_check()` picks
+            # it up transparently. This keeps '`' ([SIM_REBORN]) working normally for manual resets
+            # between attempts: that command is dispatched earlier in the SAME tick's
+            # post_step_callback() (see its command-match loop), strictly BEFORE self.safety_check()
+            # runs, so it never sees reborn() hidden.
+            _real_safety_check = pipeline.safety_check
+
+            def _safety_check_forcing_guard_stop():
+                reborn = getattr(type(env), "reborn", None)
+                if reborn is not None:
+                    del type(env).reborn
+                try:
+                    _real_safety_check()
+                finally:
+                    if reborn is not None:
+                        type(env).reborn = reborn
+
+            pipeline.safety_check = _safety_check_forcing_guard_stop
+            test_push_torso_bid = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
+            test_push_deadline = time.time() + args.sim_test_push_delay_s
+            logger.warning(
+                f"[sim-test] safety_check() will now dispatch a detected fall to guard_stop() "
+                "(reborn() is hidden only during that one call -- '`'/[SIM_REBORN] still works "
+                f"normally for manual resets); a {args.sim_test_push_force_n:.0f}N lateral test shove "
+                f"fires on the torso in {args.sim_test_push_delay_s:.0f}s -- watch for guard_stop()'s "
+                "overhead arm pose, not an auto-reset."
+            )
 
         if args.live_ball:
             # The dummy/real perception process needs the ball's TRUE simulated position, not just
@@ -622,6 +831,20 @@ def main():
             faulthandler.cancel_dump_traceback_later()
             faulthandler.dump_traceback_later(args.stall_watchdog_s, file=_stall_watchdog_file)
         time_start = time.time()
+
+        if test_push_deadline is not None:
+            if test_push_active_until is None and time_start >= test_push_deadline:
+                env.data.xfrc_applied[test_push_torso_bid, 1] = args.sim_test_push_force_n
+                test_push_active_until = time_start + TEST_PUSH_DURATION_S
+                logger.warning(
+                    f"[sim-test] test shove applied ({args.sim_test_push_force_n:.0f}N lateral, "
+                    f"{TEST_PUSH_DURATION_S:.2f}s) -- watch safety_check() dispatch to guard_stop()"
+                )
+            elif test_push_active_until is not None and time_start >= test_push_active_until:
+                env.data.xfrc_applied[test_push_torso_bid, :] = 0.0
+                test_push_deadline = None  # single-shot -- never fires again this run
+                test_push_active_until = None
+
         pipeline.step(dry_run=args.dry_run)
         if safety_monitor is not None:
             safety_monitor.check_and_log()

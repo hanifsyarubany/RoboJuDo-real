@@ -100,17 +100,20 @@ from robojudo.tools.tool_cfgs import DoFConfig
 #     "UnifiedBallKickingEnhanced/20260827_044801-stageB-skill012-h074-locomotion/model_0250000.onnx"
 # )
 
-DEFAULT_ONNX_PATH = (
-    "/workspaces/isaaclab_arena/submodules/workspaces/playground/unified_ball_kick_enhanced/logs/"
-    "UnifiedBallKickingEnhanced/20260914_211052-stageC-skill018-h074-locomotion/model_0351000.onnx"
-)
+# DEFAULT_ONNX_PATH = (
+#     "/workspaces/isaaclab_arena/submodules/workspaces/playground/unified_ball_kick_enhanced/logs/"
+#     "UnifiedBallKickingEnhanced/20260914_211052-stageC-skill018-h074-locomotion/model_0351000.onnx"
+# )
+
+# DEFAULT_ONNX_PATH = (
+#     "/workspaces/isaaclab_arena/submodules/workspaces/playground/unified_ball_kick_enhanced/logs/"
+#     "LocomotionAndBallKicking/20260915_002653-unified-stageA-locomotion-height-074-locomotion/model_0020000.onnx"
+# )
 
 DEFAULT_ONNX_PATH = (
     "/workspaces/isaaclab_arena/submodules/workspaces/playground/unified_ball_kick_enhanced/logs/"
-    "LocomotionAndBallKicking/20260915_002653-unified-stageA-locomotion-height-074-locomotion/model_0020000.onnx"
+    "UnifiedBallKickingEnhanced/20260907_100900-distill-7skills-12161718192011-distill/model_0440000.onnx"
 )
-
-
 
 
 

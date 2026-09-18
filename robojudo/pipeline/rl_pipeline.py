@@ -70,6 +70,11 @@ class RlPipeline(Pipeline):
     GUARD_STOP_LEG_RAMP_SECONDS = 0.0  # [GUARD_STOP]: legs/waist -> 0 stiffness (instant by default)
     GUARD_STOP_ARM_RAMP_SECONDS = 0.4  # [GUARD_STOP]: arms -> guard pose over this many seconds
 
+    # safety_check()'s tilt-angle trip threshold, task_mode-conditional -- see that method's comment
+    # for the 2026-09-17 empirical measurement (scratch/measure_fall_tilt.py) behind these numbers.
+    SAFETY_CHECK_LOCOMOTION_TILT_RAD = 0.44  # ~25 deg
+    SAFETY_CHECK_KICK_TILT_RAD = 1.0  # ~57 deg -- unchanged from the original single threshold
+
     def __init__(self, cfg: RlPipelineCfg):
         super().__init__(cfg=cfg)
 
@@ -143,13 +148,77 @@ class RlPipeline(Pipeline):
             return
         gravity_ori = get_gravity_orientation(self.env.base_quat)
         angle = np.arccos(np.clip(-gravity_ori[2], -1.0, 1.0))
-        if abs(angle) > 1.0:  # more than ~57 degrees
-            logger.error("Robot fallen! Shutdown for safety.")
+
+        # Task-mode-conditional threshold, not one single number -- measured empirically
+        # (scratch/measure_fall_tilt.py, 2026-09-17) before picking these:
+        #   - locomotion (walk/strafe/yaw, even an aggressive combined command): tilt never exceeded
+        #     ~5 deg in sim. SAFETY_CHECK_LOCOMOTION_TILT_RAD (~25 deg) keeps >5x margin above that
+        #     while triggering far earlier than the old single 1.0 rad (~57 deg) threshold, for the
+        #     failure mode actually seen on real hardware (gradual stance-widening/slip under low
+        #     floor friction -- see UnifiedLocoKickPolicy's own module docstring).
+        #   - kick: a single scripted in-place kick trigger (no ball present -- likely an out-of-
+        #     distribution swing target) reached 58 deg and toppled in that same test, right at the
+        #     OLD threshold. Training's own kick_swing_orientation_deadzone (0.44 rad) /
+        #     kick_swing_torso_orientation_deadzone (0.26 rad) confirm large torso deviation during a
+        #     kick's swing IS expected, not a fall -- so the kick-mode threshold is left at the
+        #     original 1.0 rad rather than guessed lower, to avoid guard_stop() firing mid-swing on a
+        #     legitimate kick (itself dangerous: killing leg authority and wrenching the arms up in
+        #     the middle of a real kick).
+        #   - a hard induced fall (sudden lateral shove) develops fast (~0.2-0.4s tilt-onset to
+        #     qpos[2]<0.4) -- thresholds from 30-57 deg all caught it within ~0.04s of each other, so
+        #     the lower locomotion threshold's real benefit is for a SLOW-developing loss of balance
+        #     (a friction-driven slip), not a sudden shove.
+        task_mode = getattr(self._inner_policy(), "task_mode", "locomotion")
+        threshold = self.SAFETY_CHECK_KICK_TILT_RAD if task_mode == "kick" else self.SAFETY_CHECK_LOCOMOTION_TILT_RAD
+
+        if abs(angle) > threshold:
+            logger.error(
+                f"Robot fallen! tilt={np.degrees(angle):.1f} deg > {np.degrees(threshold):.1f} deg "
+                f"threshold (task_mode={task_mode})"
+            )
             if hasattr(self.env, "reborn"):
                 self.env.reborn()  # pyright: ignore[reportAttributeAccessIssue]
                 self.policy.reset_alignment()
+            elif hasattr(self.env, "guard_stop"):
+                # Real hardware: engage the protective overhead guard pose (arms actively brace)
+                # instead of a flat shutdown() (arms just go limp) -- see guard_pose.py and
+                # GUARD_STOP_*_RAMP_SECONDS above for what this does. One-way, same as the
+                # shutdown() this replaces -- recovering requires a fresh pipeline.prepare(), i.e. a
+                # process restart, exactly as before.
+                self.env.guard_stop(
+                    leg_ramp_seconds=self.GUARD_STOP_LEG_RAMP_SECONDS,
+                    arm_ramp_seconds=self.GUARD_STOP_ARM_RAMP_SECONDS,
+                )
             else:
                 self.env.shutdown()
+
+    def stop_with_guard_pose(self, reason: str):
+        """THE stop implementation -- every stop command routes here (operator decision,
+        2026-09-18), so the robot ends up braced in guard_pose.py's overhead pose no matter which
+        stop was pressed, in sim and on real hardware alike, instead of going limp.
+
+        Replaces what used to be three deliberately-different mechanisms ([SHUTDOWN]'s instant
+        unconditional cut, [SOFT_STOP]'s gentle ramp, [ESTOP*]'s sim-only cut variants). The
+        tradeoff that split them in the first place, accepted knowingly here: guard_stop() holds
+        the pose by re-pushing gains from THIS process every tick (see MujocoEnv's and
+        UnitreeCppEnv's guard_stop() docstrings), so unlike the instant shutdown() it replaces it
+        DEPENDS on this control loop continuing to run -- if the process dies or freezes mid-ramp,
+        whatever gains were last pushed stay frozen rather than dropping to zero.
+
+        env.shutdown() is still there for callers that specifically need an unconditional cut with
+        no liveness assumption: run_pipeline_prepared.py's excessive-frame-drop exit deliberately
+        still uses it, because that path fires precisely when the loop is NOT running reliably --
+        exactly the condition under which a guard ramp cannot be held.
+        """
+        if hasattr(self.env, "guard_stop"):
+            logger.warning(f"{reason} -> guard pose (legs/waist to zero stiffness, arms bracing and holding)")
+            self.env.guard_stop(
+                leg_ramp_seconds=self.GUARD_STOP_LEG_RAMP_SECONDS,
+                arm_ramp_seconds=self.GUARD_STOP_ARM_RAMP_SECONDS,
+            )
+        else:
+            logger.warning(f"{reason} -> this env has no guard_stop(); falling back to shutdown()")
+            self.env.shutdown()
 
     def post_step_callback(self, env_data, ctrl_data, extras, pd_target):
         self.timestep += 1
@@ -157,67 +226,14 @@ class RlPipeline(Pipeline):
         for command in commands:
             match command:
                 case "[SHUTDOWN]":
-                    logger.warning("Emergency shutdown!")
-                    self.env.shutdown()
-                case "[ESTOP]" | "[ESTOP_SLOW]" | "[ESTOP_REAL]":
-                    # Sim-only: lets you OBSERVE what a torque cut looks like without closing the
-                    # viewer (unlike [SHUTDOWN], which just kills the window -- see estop()'s
-                    # docstring). hasattr-gated the same way [SIM_REBORN] below is: real envs
-                    # (UnitreeCppEnv) don't implement this, since [SHUTDOWN] already covers the
-                    # real E-stop path and blindly zeroing gains isn't something to bind on
-                    # hardware.
-                    #   [ESTOP]      = instant kp->0, kd unchanged (this checkpoint's trained kd)
-                    #   [ESTOP_SLOW] = kp ramps to 0 over ESTOP_SLOW_RAMP_SECONDS instead of
-                    #                  stepping there in one tick -- a gentler, "slow motion"
-                    #                  settle (see estop()'s docstring for why a ramp can look
-                    #                  LESS violent than an instant cut, not just slower)
-                    #   [ESTOP_REAL] = instant kp->0 with kd forced to ESTOP_REAL_DAMPING_KD (flat
-                    #                  5.0 for every joint) -- an exact sim replica of what real
-                    #                  hardware's UnitreeCppEnv.shutdown() actually does (verified
-                    #                  from unitree_cpp's own source, see MujocoEnv.estop()'s
-                    #                  docstring), which is itself instant/unramped
-                    if hasattr(self.env, "estop"):
-                        if command == "[ESTOP_SLOW]":
-                            self.env.estop(ramp_seconds=self.ESTOP_SLOW_RAMP_SECONDS)
-                        elif command == "[ESTOP_REAL]":
-                            self.env.estop(damping=self.env.ESTOP_REAL_DAMPING_KD)
-                        else:
-                            self.env.estop()
-                    else:
-                        logger.warning(
-                            f"{command} not supported on this env type -- use [SHUTDOWN] instead."
-                        )
-                case "[SOFT_STOP]":
-                    # DELIBERATE, non-emergency stop -- distinct from [SHUTDOWN] above, which stays
-                    # completely untouched by this and remains the fast/unconditional real E-stop.
-                    # Works on BOTH sim (MujocoEnv.soft_stop) and real (UnitreeCppEnv.soft_stop) with
-                    # the identical call signature, so the exact same binding can be rehearsed in
-                    # sim before ever trusting it on hardware. See either method's docstring for the
-                    # full rationale (in particular: real hardware's soft_stop() has NO recovery
-                    # path and a weaker liveness guarantee than [SHUTDOWN] -- never treat it as the
-                    # primary E-stop).
-                    if hasattr(self.env, "soft_stop"):
-                        self.env.soft_stop(ramp_seconds=self.SOFT_STOP_RAMP_SECONDS)
-                    else:
-                        logger.warning(
-                            "[SOFT_STOP] not supported on this env type -- use [SHUTDOWN] instead."
-                        )
-                case "[GUARD_STOP]":
-                    # DELIBERATE reflex: legs/waist cut to zero stiffness WHILE the arms actively
-                    # move to an overhead head-guard pose and hold it -- see
-                    # MujocoEnv.guard_stop()/UnitreeCppEnv.guard_stop()'s docstrings for the pose's
-                    # derivation and the (real, but reasoned-not-sourced) caveats. Distinct from
-                    # both [SHUTDOWN] (untouched, fast/unconditional) and [SOFT_STOP] (no arm
-                    # motion at all) -- works identically on sim and real like [SOFT_STOP] does.
-                    if hasattr(self.env, "guard_stop"):
-                        self.env.guard_stop(
-                            leg_ramp_seconds=self.GUARD_STOP_LEG_RAMP_SECONDS,
-                            arm_ramp_seconds=self.GUARD_STOP_ARM_RAMP_SECONDS,
-                        )
-                    else:
-                        logger.warning(
-                            "[GUARD_STOP] not supported on this env type -- use [SHUTDOWN] instead."
-                        )
+                    self.stop_with_guard_pose("[SHUTDOWN]")
+                # Every stop command now routes to the SAME guard-pose stop (operator decision,
+                # 2026-09-18) -- see stop_with_guard_pose()'s docstring for what that replaced and
+                # the liveness tradeoff accepted in doing so. The sim-only [ESTOP*] keys kept their
+                # separate bindings but no longer do three different torque-cut flavours, so they
+                # are now exact duplicates of [GUARD_STOP] and could simply be unbound.
+                case "[ESTOP]" | "[ESTOP_SLOW]" | "[ESTOP_REAL]" | "[SOFT_STOP]" | "[GUARD_STOP]":
+                    self.stop_with_guard_pose(command)
                 case "[SIM_REBORN]":
                     if hasattr(self.env, "reborn"):
                         logger.warning("Simulation Env reborn!")
