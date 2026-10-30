@@ -200,6 +200,8 @@ def main():
     ap.add_argument("--prepare-seconds", type=float, default=3.0, help="real: the ramp to the ready pose, and again for the blend-in")
     ap.add_argument("--stale-steps", type=int, default=15, help="stop after this many control steps (20 ms) without a fresh pelvis pose")
     ap.add_argument("--max-tilt-deg", type=float, default=40.0)
+    ap.add_argument("--pelvis-stale-ms", type=float, default=None, help="a pelvis pose older than this (camera capture -> this control "
+                    "step) counts as stale for the watchdog (default: the config's pelvis_stale_s, 50 ms)")
     ap.add_argument("--max-seconds", type=float, default=0.0, help="stop after this long (sim time in sim); 0: no limit")
     ap.add_argument("--window", action="store_true", help="sim: open the MuJoCo viewer")
     ap.add_argument("--realtime", action="store_true", help="sim: pace to real time (default: as fast as possible)")
@@ -223,6 +225,8 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     cfg = ConfigManager(config_name=a.config).get_cfg()
+    if a.pelvis_stale_ms is not None:
+        cfg.policy.pelvis_stale_s = a.pelvis_stale_ms / 1000.0
     sim = bool(cfg.env.is_sim)
     for c in cfg.ctrl:
         if c.ctrl_type == "PingPongSimWorldCtrl":
@@ -347,6 +351,11 @@ def main():
             rec["ok"].append(bool(info.get("ok", False)))
             # ---- watchdogs
             n_stale = n_stale + 1 if (not info.get("ok", False) or info.get("pelvis_age", np.inf) > cfg.policy.pelvis_stale_s) else 0
+            if not sim and n % 250 == 0:  # the robot: how old perception's pelvis pose is here, every 5 s
+                ag = np.array([x for x in rec["pelvis_age"][-250:] if np.isfinite(x)]) * 1000
+                if len(ag):
+                    logger.info(f"[player] pelvis pose age (camera -> this control step) p50 {np.median(ag):.0f} / p95 "
+                                f"{np.percentile(ag, 95):.0f} / max {ag.max():.0f} ms; stale above {cfg.policy.pelvis_stale_s * 1000:.0f} ms")
             q, dq = env.dof_pos, env.dof_vel
             target = policy._hold if hasattr(policy, "_hold") else None
             if target is not None:
