@@ -240,6 +240,18 @@ if DEPLOY_TARGET == "sim":
     _KB_SIM_SAFETY_TRIGGERS["p"] = "[ESTOP]"  # instant kp->0, kd = this checkpoint's trained values
     _KB_SIM_SAFETY_TRIGGERS["o"] = "[ESTOP_SLOW]"  # kp ramps to 0 over RlPipeline.ESTOP_SLOW_RAMP_SECONDS
     _KB_SIM_SAFETY_TRIGGERS["r"] = "[ESTOP_REAL]"  # instant kp->0, kd=5.0 flat -- exact real-hw replica
+
+# [RESPAWN_BALL] ('m'): manually teleport the physical MuJoCo ball back to the PENDING skill's
+# nominal spawn -- see run_pipeline_prepared.py's BallRespawner. Sim-only for the same reason as
+# the safety triggers above: real hardware has no physical ball to teleport, so binding this key
+# there would look live but silently no-op (BallRespawner is only ever constructed when
+# ball_qpos_addr exists, which needs cfg.env.is_sim). --live-ball is also required (no ball
+# controller, no BallRespawner) -- pressing 'm' without it logs a warning instead of doing nothing
+# silently. As of 2026-09-21 this is the ONLY way the ball resets (operator decision) -- the old
+# automatic respawn-on-kick-end is opt-in only, via --auto-respawn-ball.
+_KB_SIM_SCENE_TRIGGERS = {}
+if DEPLOY_TARGET == "sim":
+    _KB_SIM_SCENE_TRIGGERS["m"] = "[RESPAWN_BALL]"
 # RB+Left/RB+Right are taken by g1_unified_loco_kick_amo's policy_switch_triggers (merged into this
 # same dict there -- see _make_ctrl) for AMO<->unified switching, so cycle-skill uses RB+X instead
 # to avoid a silent collision in that config. X is unbound elsewhere in this policy's controls.
@@ -329,6 +341,7 @@ def _make_ctrl(policy_switch_triggers: dict | None = None):
                     **_KB_KICK_TRIGGERS,
                     **_KB_SOFT_STOP_TRIGGER,
                     **_KB_SIM_SAFETY_TRIGGERS,
+                    **_KB_SIM_SCENE_TRIGGERS,
                 },
                 triggers_extra=kb_extra,
             )

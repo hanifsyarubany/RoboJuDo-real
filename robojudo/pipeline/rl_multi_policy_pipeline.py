@@ -121,6 +121,7 @@ class RlMultiPolicyPipeline(RlPipeline):
         self.timestep += 1
 
         commands = ctrl_data.get("COMMANDS", [])
+        self.last_commands = commands  # see RlPipeline.post_step_callback's comment on this
         for command in commands:
             match command:
                 # All stop commands route to RlPipeline.stop_with_guard_pose() (operator decision,

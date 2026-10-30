@@ -1,0 +1,191 @@
+# G1 table tennis: deployment guide
+
+Two programs (dual deployment), the same in simulation and on the robot. Only what feeds PERCEPTION and what the PLAYER drives change.
+
+```
+ simulation:  MuJoCo world's simulated cameras --.                                 .-- MuJoCo robot
+                                                 >-- raw --> PERCEPTION --table--> PLAYER --<
+ real robot:  Motive --> natnet_relay.py --------'  UDP 7770   (one program)  frame  (one     '-- G1 (unitree_cpp)
+                                                                              UDP 7780 program)
+```
+
+| | PERCEPTION | PLAYER |
+|---|---|---|
+| program | `scripts/deploy/run_perception.py` (pingpong folder) | `scripts/run_pingpong.py` (RoboJuDo) |
+| in | raw OptiTrack frames: the pelvis rigid body + unlabeled markers, OptiTrack's coordinates (UDP 7770) | perception's messages (UDP 7780) + the robot's IMU and joints |
+| does | table frame (calibration), pelvis pose in the table frame, which marker is the incoming ball, shot start / end | ball estimator, planner, swing clock, policy (`pingpong.deploy.PingPongRuntime`) |
+| out | one message per frame, table frame (`pingpong/deploy/perception.py`) | joint targets |
+| sim vs real | identical command | `-c g1_pingpong` (MuJoCo) or `-c g1_pingpong_real` (G1) |
+
+The player never sees OptiTrack's coordinates; perception never sees the robot's joints. Timestamps need no clock synchronization on the
+robot (each message carries its age) and follow the simulated world's clock in simulation (`pingpong/deploy/mocap.py`), where the player
+and perception run in lockstep, so a simulation may run at any speed.
+
+**Status: runs in simulation, never on the robot.** What was run and what was not: "What is tested".
+
+Python: RoboJuDo's environment, `conda_env/robojudo/bin/python` (written `python` below); it has numba. Folders: RoboJuDo =
+`humanoid_deployment/RoboJuDo`, pingpong = `playground/humanoid_pingpong/pingpong-version-0`.
+
+## A. Simulation
+
+**A1. Unit tests** (pingpong folder), each prints `all passed`:
+```bash
+for t in shot_detector table_frame emulator mocap_calibration perception table_rigid_body table_markers_layouts ball_markers natnet_relay; do
+  python tests/deploy/test_$t.py | tail -1; done
+```
+
+**A2. The two programs.** Either may start first; the player waits for perception before anything moves.
+```bash
+# terminal 1 (RoboJuDo): the player; its MuJoCo world sends the simulated cameras' raw frames to UDP 7770
+python scripts/run_pingpong.py -c g1_pingpong --window --realtime
+# terminal 2 (pingpong): perception, calibrating on the simulated table markers first
+python scripts/deploy/run_perception.py run --calibrate-first --out calibration/table_frame_sim.json
+```
+What you see: perception prints the calibrated table (height, width, length against `table.yaml`), then a status line every 2 s (pelvis
+seen, the pelvis in the table frame, shots and how they ended). The player prints `perception is up: pelvis at (...)` next to the simulated
+truth, then plays. Window: the ball orange, the racket target blue, the station green, home grey. At the end: each ball's outcome, the
+stage timings, joint targets outside the joint range, perception messages and lockstep timeouts (should be 0). Drop `--window --realtime`
+for a headless run as fast as the computer goes.
+
+The opponent serves without end: the scenario's 64 sequences of 8 balls in turn (512 balls, then again), or fresh balls with
+`--random standard` (or `topspin`, `short`, `deep_fast`, ...). Stop with Ctrl-C or by closing the window; `--n-shots N` or `--max-seconds S`
+set a limit. A progress line every 10 balls; the summary at the end.
+
+**A3. Variations** (player flags): `--sensing camera` (100 Hz, 5 mm, 30 ms; give perception `--noise 0.005`), `--start-offset 0.2 0.1 10`
+(start off home), `--balls topspin`, `--env-idx 5` (another ball sequence), `--opti-frame fixed`.
+
+**A4. Fast batch runs** (one process, perception inside, planner inline): `python scripts/run_pingpong.py -c g1_pingpong_inproc --n-shots 64
+--compute-scale 0`. Same play; use it for statistics.
+
+## B. The real robot
+
+Nothing changes in the player but `-c g1_pingpong_real`; nothing changes in perception at all. What is new is what feeds them.
+
+**B1. Install** on the control PC (an external PC on the robot's Ethernet; the G1's own computer is too slow for the planner): RoboJuDo's
+environment + `numba`, `unitree_sdk2` + `unitree_cpp` (`docs/unitree_setup.md`), the pingpong folder (or `pingpong/`, `configs/`,
+`data/motions/npz/swings_mix.npz`, `data/planner_tables/`, `calibration/`; `PINGPONG_ROOT` if it lives elsewhere). The policy
+itself is in RoboJuDo: `assets/motions/g1/pingpong_play/model_16500.pt` + its `params/` (stage4-fix6-7 @16500, the default for
+simulation and the robot; `--checkpoint` for another). Check:
+`python -c "from robojudo.environment import UnitreeCppEnv"`. Without torch there: `Actor('model_16500.pt').export_npz('actor.npz')` and
+`--actor-path actor.npz`.
+
+**B2. Network.** The control PC on the G1's subnet (192.168.123.x): `NET_IF` in `robojudo/config/g1/g1_pingpong_cfg.py`. Perception may run
+on the control PC (default ports, localhost) or elsewhere (`--send <player host>:7780`).
+
+**B3. OptiTrack.** Ground plane set so z = 0 is the floor; stream **Z-up**; a pelvis rigid body with its pivot at the pelvis origin and the
+pelvis axes (x forward, z up). The table: markers on (at least) the table top's near-left, near-right and a far corner, at one height, plus any
+others you like (e.g. the lab table: 4 corners on the top + the middle of each side on the side faces, 8 markers; calibration finds the
+corners by the table's size, and the simulation uses this layout), made a rigid body
+named `table` (recommended: its markers then travel apart from the unlabeled ones, can never pass for the ball, stay on during
+play, and perception's status line says if the table moves). Without a table rigid body, plain corner markers work too: calibrate, then
+take them off. **The ball** stays unlabeled (no rigid body: it spins too fast for Motive to keep one). A ball with dot stickers gives
+one unlabeled marker per sticker the cameras see (often 2-5); the relay sends them all and perception makes them one ball (B4).
+The relay reads Motive with the lab's unicast NatNet client (`scripts/deploy/natnet_client.py`) and runs on any computer that reaches
+Motive, simplest the control PC next to perception (pingpong folder):
+```bash
+python scripts/deploy/natnet_relay.py    # defaults: Motive 192.168.123.200, this computer 192.168.123.164, to 127.0.0.1:7770
+# elsewhere: --client <its address> (or '' for any), --to <perception's computer>
+```
+Motive > Streaming: Unicast; Rigid Bodies, Labeled Markers, Unlabeled Markers on. Motive's default y-up axes are turned to z-up by the
+relay (`--up y`, the default; `--up z` if Motive streams z-up). Its status line every 2 s: Motive's frame rate, latency (from Motive's
+camera timestamps), pelvis tracked, `table markers 8.0/frame`, unlabeled markers per frame. Tested only against a fake Motive
+(`tests/deploy/test_natnet_relay.py`), not a real one.
+
+**B4. Perception.** The robot standing at home:
+```bash
+python scripts/deploy/run_perception.py calibrate --marker-height <marker radius>   # -> calibration/table_frame.json; within 1 cm of table.yaml?
+python scripts/deploy/run_perception.py run              # status every 2 s: carry the robot, the pelvis follows; roll a ball, a shot starts
+```
+**The robot must face the table squarely during `calibrate`**: Motive gives a new rigid body its world's axes, whichever way the
+robot faced, so calibration measures the pelvis rigid body's heading and corrects it to 0 (`pelvis: the rigid body's x axis was at
++37.0 deg ...`; saved in table_frame.json; a placement error stays as a heading error: use a line on the floor). A rigid body whose
+up axis is more than 20 deg from vertical is refused (fix it in Motive). `--keep-pelvis-axes` takes Motive's axes as they are.
+With a table rigid body the status line ends in `table steady (0.1 mm)`; `table MOVED 12 mm: STOP and recalibrate` means it was bumped.
+The ball (`--ball`, `pingpong/deploy/ball_markers.py`): `stickers` (the default) groups the markers within one ball diameter into one
+ball and fits the sphere of the ball's radius through them, which finds the centre; the markers' mean would sit ~6 mm toward the
+cameras, since they see the stickers that face them. A sample needs 3 or more markers (1-2 are 8-20 mm off; simulation: with them the
+robot returned 2 points fewer balls). The status line shows `markers per ball sample 3:27% 4:52% 5:21%`: if shots are not detected or
+few samples come, too few stickers are seen - add stickers, spread evenly. `covered`: a ball covered in reflective material, one
+marker at its centre (with `stickers` such a ball is never seen: shots 0). Stickers add mass and change the bounce: weigh the ball
+(`ball.yaml`: 2.7 g) and fit its model to real flights (B8).
+With plain corner markers, take them off after `calibrate`.
+(or `run --calibrate-first`, as in simulation). Redo the calibration whenever the table may have moved.
+
+**B4b. Seeing it in rviz2 (optional).** `run --publish-data` also publishes perception's data to ROS 2 (`pingpong/deploy/ros_viz.py`,
+60 Hz, `--publish-hz`), all in the table frame `pp_table`:
+
+| | |
+|---|---|
+| TF | `optitrack -> pp_table` (the calibration, static), `pp_table -> pp_pelvis` |
+| `/pingpong/pelvis` | `geometry_msgs/PoseStamped` |
+| `/pingpong/ball` | `geometry_msgs/PointStamped`, while a shot is on |
+| `/pingpong/ball_centre` | `geometry_msgs/PointStamped`, the ball's fitted centre whenever it is seen (held, rolled, in flight) |
+| `/pingpong/table` | `geometry_msgs/PolygonStamped`, the top's 4 corners |
+| `/pingpong/markers` | `visualization_msgs/MarkerArray`: table top + outline + centre line, net, home, the ball's centre (one orange dot per ball), during a shot a red shell + its trail, the table rigid body's markers (green); with `--publish-raw-markers` also every unlabeled marker (white: each sticker) |
+
+rclpy on Foxy is built for Python 3.8, so perception runs on a Python 3.8: the conda env `scripts/deploy/g1_perception_env.yml`
+(python 3.8, numpy 1.24, PyYAML: all that the relay and perception import) with ROS sourced after activating, or the system
+python3 with `python3-numpy python3-yaml`. Perception's code runs on 3.8 (tested):
+```bash
+conda activate pingpong_perception && source /opt/ros/foxy/setup.bash
+cd <pingpong folder> && python scripts/deploy/run_perception.py run --publish-data
+# on a computer with a screen, same network and ROS_DOMAIN_ID:
+source /opt/ros/foxy/setup.bash && rviz2 -d <pingpong folder>/scripts/deploy/pingpong.rviz
+```
+Check `ros2 topic list` / `ros2 topic hz /pingpong/markers` where rviz2 runs. A display without data: set its topic in the Displays
+panel (Add > By topic lists them). Tested against stand-in ROS modules only (`tests/deploy/test_ros_viz.py`), not a real ROS 2.
+
+**B5. Player, dry run** (no torque; robot hanging or sitting): `python scripts/run_pingpong.py -c g1_pingpong_real --dry-run`. It waits
+for perception, prints the pelvis pose, then computes everything every step. Look at the stage timings (the robot's part under ~5 ms),
+`ActionMonitor` warnings, a rolled ball's shot and swing.
+
+**B6. Gantry, feet off the floor:** `python scripts/run_pingpong.py -c g1_pingpong_real`. After perception is up: the joints ramp to the
+READY pose in 3 s, the policy blends in over 3 s, then holds the ready pose. Remote: **A** = shutdown, **Select** = soft stop, **Start** =
+guard pose.
+
+**B7. On the floor** (rope slack, attached): stand 1-2 min; measure the motor delay (command to motion; fix6-7 trained with 0-20 ms).
+
+**B8. Balls:** slow, well-placed serves from a launcher first; fit the ball and rubber models (`ball.yaml`) to real flights before judging.
+
+## Watchdogs and stops
+
+Every stop on the robot is RoboJuDo's guard stop: **legs and waist go limp at once (damped), the arms brace in the guard pose. The
+robot falls unless the gantry or rope holds it** (in MuJoCo the pelvis drops from 0.79 to 0.39 m in 1.5 s). The control loop carries
+the guard out, so after a stop the player keeps running and holds it **until Ctrl-C**; then it ends and the motors are released.
+
+| what stops | when |
+|---|---|
+| remote **A**, **Select** or **Start** | during play, and during the start-up ramp and blend (read from the robot's raw remote state there; held for 2 control steps, 40 ms, so one corrupted radio packet does not stop it) |
+| **Ctrl-C** in the player's terminal | any time; a second Ctrl-C ends the program |
+| watchdogs | perception's pelvis pose not fresh for `--stale-steps` steps (default 15 = 0.3 s), pelvis below 0.45 m or tilted more than `--max-tilt-deg` (40), a NaN in the targets |
+
+Before perception is up nothing is commanded (the player gives up after `--wait-perception` s without moving). Without a stop button
+on the remote the player refuses to apply torque. **A stop needs the player running**: if it is killed or hangs, the last command
+stays - keep the rope on and Unitree's own stop (power) at hand. Not run on the robot: tested against a stand-in robot (the remote's
+button word, start-up, the hold) and RoboJuDo's MuJoCo environment. A ball that comes while the robot is still in a swing is not
+planned (`shots while busy`).
+
+## Things to know before the first run
+
+* **Targets beyond the joint range:** in about 5 % of steps the policy's targets lie past the stop (left ankle pitch up to ~0.6 rad,
+  waist pitch ~0.5, waist roll ~0.4; printed at the end of a run). Training does the same, so it is what the policy expects; the motor
+  pushes into the stop with up to ~14-17 N m. Watch ankle and waist temperatures; decide on clipping after a dry run.
+* **Pelvis pose latency:** OptiTrack's pose is 10-30 ms old; the player carries it forward to the present at its fitted velocity.
+* **Planner jobs on a worker thread** (`threaded=True` on the robot and in `g1_pingpong`), with numba's `nogil`, so a 20 ms job never holds
+  up the 50 Hz loop; one math thread per process.
+* **The ball model** (`ball.yaml`, from published values) predicts every plan: fit it to your ball, table and rubber.
+* **Paddle mount:** about 2 degrees is tolerable (1 degree about the blade's long axis); weigh the parts `robot_parts.yaml` marks `estimate`.
+* The robot must stand roughly at home, facing the table (within ~10 degrees), when the first ball comes.
+
+## What is tested
+
+| | |
+|---|---|
+| unit tests (A1) | shot detector (real flights, clutter, dropouts, a stray marker next to a static one), table frame, emulator, raw packet + UDP + calibration, perception messages + their wire format in both clock modes, table rigid body + marker layouts, stickered ball (centre within 1.4 mm p50 from 4+ markers, 2 mm from 3) |
+| stickered ball, `sim_runtime.py --ball_stickers 6` (pingpong), 512 balls | returned 90.0 % vs 90.6 % with a one-marker ball (standard balls; 5 vs 2 balls differ, not significant), 86.9 % vs 86.5 % (topspin); every ball detected. Simulated: 8 cameras round the table 2.7 m up, a sticker seen when 2 face it within 65 deg, 10 % missed |
+| `live_mujoco.py` on the shared code | identical to the original script shot for shot (224 shots, 4 settings) |
+| `scripts/deploy/sim_runtime.py` (pingpong) | 512 balls: 90.8 % with emulated OptiTrack vs 92.8 % with ideal inputs (not significant); splitting perception out changed none of the 512 shots |
+| the two programs in simulation (A2) | 8/8 and 7/8 on two ball sequences, the same as the one-process run; perception calibrated exactly; either start order; 0 lockstep timeouts |
+| perception against `fake_relay.py` (real-time timestamps) | calibrates the relay's frame, 240 frames/s, shots detected |
+| `natnet_relay.py` against a fake Motive (pingpong `tests/deploy/test_natnet_relay.py`) | NatNet 4.1 packets as the lab client parses them, y-up: pelvis pose, the table's 8 markers (occluded left out), unlabeled markers, latency 4.5 ms from the camera timestamps; the chain fake Motive -> relay -> perception calibrates the table exactly and detects the stickered ball's serves |
+| **not tested** | anything with a real Motive or on the G1: the relay on a real stream, `UnitreeCppEnv` with this policy, `prepare()` to the ready pose, the remote's stops, motor delay, the real ball model, the watchdogs against a real fault |

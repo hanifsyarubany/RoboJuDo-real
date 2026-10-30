@@ -115,6 +115,16 @@ DEFAULT_ONNX_PATH = (
     "UnifiedBallKickingEnhanced/20260907_100900-distill-7skills-12161718192011-distill/model_0440000.onnx"
 )
 
+# DEFAULT_ONNX_PATH = (
+#     "/workspaces/isaaclab_arena/submodules/workspaces/playground/unified_ball_kick_enhanced/logs/"
+#     "UnifiedBallKickingEnhanced/20260914_111923-stageC-skill012-h074-locomotion/model_0417000.onnx"
+# )
+
+# DEFAULT_ONNX_PATH = (
+#     "/workspaces/isaaclab_arena/submodules/workspaces/playground/unified_ball_kick_enhanced/logs/"
+#     "UnifiedBallKickingEnhanced/20260915_024715-distill-6skills-121617181920-distill/model_0445000.onnx"
+# )
+
 
 
 class G1UnifiedLocoKickDoF(DoFConfig):

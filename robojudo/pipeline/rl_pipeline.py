@@ -223,6 +223,11 @@ class RlPipeline(Pipeline):
     def post_step_callback(self, env_data, ctrl_data, extras, pd_target):
         self.timestep += 1
         commands = ctrl_data.get("COMMANDS", [])
+        # Exposed for callers OUTSIDE this class (e.g. run_pipeline_prepared.py's ball respawn) that
+        # need to react to a command this tick without adding an env/scene-specific case to the
+        # match below -- this class is deliberately scene-agnostic (see BallRespawner's own
+        # docstring: "this policy class itself never spawns or moves anything physical").
+        self.last_commands = commands
         for command in commands:
             match command:
                 case "[SHUTDOWN]":

@@ -1,0 +1,623 @@
+<title>Sideline Controls</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Archivo:ital,wght@0,400;0,500;0,600;0,700;1,500&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#eef1e9;
+    --surface:#ffffff;
+    --surface-2:#e2e8dc;
+    --ink:#181c15;
+    --ink-soft:#57624f;
+    --ink-faint:#8b9682;
+    --accent:#2c6a3b;
+    --accent-ink:#ffffff;
+    --accent-bright:#c97a1f;
+    --danger:#a83a2c;
+    --danger-soft:#f3ddd7;
+    --line:#c7cfbc;
+    --pad-fill:#ffffff;
+    --pad-line:#c7cfbc;
+    --shadow:0 10px 30px -12px rgba(24,28,21,.25);
+    --radius-s:3px;
+    --radius-m:6px;
+    --font-display:'Bebas Neue', 'Arial Narrow', sans-serif;
+    --font-body:'Archivo', 'Helvetica Neue', Arial, sans-serif;
+    --font-mono:'JetBrains Mono', 'SFMono-Regular', Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --bg:#12150f;
+      --surface:#1b2016;
+      --surface-2:#242a1d;
+      --ink:#eef1e6;
+      --ink-soft:#aab49d;
+      --ink-faint:#727d67;
+      --accent:#7cb672;
+      --accent-ink:#0e1409;
+      --accent-bright:#e3a04c;
+      --danger:#e58472;
+      --danger-soft:#3a231e;
+      --line:#333a2a;
+      --pad-fill:#20261a;
+      --pad-line:#3a4230;
+      --shadow:0 10px 30px -10px rgba(0,0,0,.6);
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#12150f;
+    --surface:#1b2016;
+    --surface-2:#242a1d;
+    --ink:#eef1e6;
+    --ink-soft:#aab49d;
+    --ink-faint:#727d67;
+    --accent:#7cb672;
+    --accent-ink:#0e1409;
+    --accent-bright:#e3a04c;
+    --danger:#e58472;
+    --danger-soft:#3a231e;
+    --line:#333a2a;
+    --pad-fill:#20261a;
+    --pad-line:#3a4230;
+    --shadow:0 10px 30px -10px rgba(0,0,0,.6);
+  }
+
+  *{box-sizing:border-box;}
+  body{
+    margin:0;
+    background:var(--bg);
+    color:var(--ink);
+    font-family:var(--font-body);
+    -webkit-font-smoothing:antialiased;
+    padding-inline:20px;
+  }
+  main{max-width:1080px;margin:0 auto;}
+  h1,h2,h3{text-wrap:balance;font-family:var(--font-display);letter-spacing:.02em;font-weight:400;margin:0;}
+  p{line-height:1.55;}
+  kbd{
+    font-family:var(--font-mono);
+    font-size:.78em;
+    background:var(--surface-2);
+    border:1px solid var(--line);
+    border-bottom-width:2px;
+    border-radius:4px;
+    padding:.1em .45em;
+    color:var(--ink);
+  }
+  code, .token{
+    font-family:var(--font-mono);
+  }
+
+  /* ---------- topbar ---------- */
+  .topbar{
+    max-width:1080px;margin:0 auto;
+    display:flex;align-items:flex-end;justify-content:space-between;gap:24px;flex-wrap:wrap;
+    padding-block:28px 18px;
+    border-bottom:2px solid var(--line);
+  }
+  .eyebrow{
+    display:block;
+    font-family:var(--font-mono);
+    font-size:.72rem;
+    letter-spacing:.14em;
+    text-transform:uppercase;
+    color:var(--accent);
+    margin-bottom:4px;
+  }
+  .topbar h1{font-size:clamp(2.1rem,5vw,2.9rem);}
+  .topbar .sub{color:var(--ink-soft);font-size:.94rem;max-width:46ch;margin-top:6px;}
+
+  .mode-switch{
+    display:inline-flex;
+    background:var(--surface);
+    border:1px solid var(--line);
+    border-radius:999px;
+    padding:4px;
+    gap:4px;
+    box-shadow:var(--shadow);
+  }
+  .mode-btn{
+    font-family:var(--font-body);
+    font-weight:600;
+    font-size:.82rem;
+    border:none;
+    background:transparent;
+    color:var(--ink-soft);
+    padding:8px 16px;
+    border-radius:999px;
+    cursor:pointer;
+    text-align:left;
+    line-height:1.3;
+  }
+  .mode-btn small{display:block;font-weight:500;font-size:.72rem;color:inherit;opacity:.75;}
+  .mode-btn[aria-pressed="true"]{background:var(--accent);color:var(--accent-ink);}
+  .mode-btn[aria-pressed="true"] small{color:inherit;opacity:.85;}
+  .mode-btn:focus-visible, .zone:focus-visible, button:focus-visible{outline:2px solid var(--accent-bright);outline-offset:2px;}
+
+  /* ---------- console: pad + detail ---------- */
+  .console{
+    display:grid;
+    grid-template-columns:minmax(320px,1.15fr) minmax(280px,.85fr);
+    gap:28px;
+    padding-block:32px;
+    align-items:start;
+  }
+  .pad-wrap{
+    background:var(--surface);
+    border:1px solid var(--line);
+    border-radius:var(--radius-m);
+    padding:20px 18px 16px;
+    box-shadow:var(--shadow);
+  }
+  .pad-wrap .cap{
+    display:flex;justify-content:space-between;align-items:baseline;
+    font-family:var(--font-mono);font-size:.72rem;letter-spacing:.08em;text-transform:uppercase;
+    color:var(--ink-faint);margin-bottom:6px;
+  }
+  svg.pad{width:100%;height:auto;display:block;}
+  .pad-body{filter:drop-shadow(0 6px 14px rgba(24,28,21,.18));}
+  .pad-body path, .pad-body rect, .pad-body circle{fill:var(--pad-fill);}
+
+  .zone{cursor:pointer;transition:opacity .15s ease;}
+  @media (prefers-reduced-motion: reduce){.zone{transition:none;}}
+  .zone rect, .zone circle{
+    stroke:var(--pad-line);
+    stroke-width:1.5;
+    fill:var(--surface-2);
+  }
+  .zone .fill-label{
+    font-family:var(--font-mono);
+    font-size:9.5px;
+    fill:var(--ink-soft);
+    text-anchor:middle;
+    dominant-baseline:middle;
+    pointer-events:none;
+    letter-spacing:.02em;
+  }
+  .zone.lit rect, .zone.lit circle{fill:var(--accent);stroke:var(--accent);}
+  .zone.lit .fill-label{fill:var(--accent-ink);font-weight:600;}
+  .zone.dim{opacity:.32;}
+  .zone.armed rect, .zone.armed circle{fill:var(--accent-bright);stroke:var(--accent-bright);}
+  .zone.armed .fill-label{fill:var(--accent-ink);font-weight:700;}
+  .zone.pinned rect, .zone.pinned circle{stroke:var(--ink);stroke-width:2.5;}
+  .zone.unbound rect, .zone.unbound circle{fill:none;stroke-dasharray:2 3;}
+  .zone.unbound .fill-label{fill:var(--ink-faint);}
+  .stick-ring{fill:none;stroke:var(--pad-line);stroke-width:1.5;}
+
+  .hint{
+    font-size:.82rem;color:var(--ink-soft);margin:14px 2px 0;text-align:center;
+  }
+  .hint kbd{margin-inline:1px;}
+
+  .detail{
+    background:var(--surface);
+    border:1px solid var(--line);
+    border-radius:var(--radius-m);
+    padding:22px 22px 20px;
+    box-shadow:var(--shadow);
+    min-height:340px;
+    display:flex;flex-direction:column;gap:12px;
+  }
+  .detail .d-eyebrow{
+    font-family:var(--font-mono);font-size:.7rem;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-faint);
+  }
+  .detail h2{font-size:1.9rem;line-height:1;}
+  .detail .badges{display:flex;gap:6px;flex-wrap:wrap;}
+  .badge{
+    font-family:var(--font-mono);font-size:.68rem;letter-spacing:.04em;text-transform:uppercase;
+    padding:3px 9px;border-radius:999px;border:1px solid var(--line);color:var(--ink-soft);
+  }
+  .badge.cmd{background:var(--surface-2);color:var(--ink);font-weight:600;}
+  .badge.warn{background:var(--danger-soft);border-color:var(--danger);color:var(--danger);}
+  .detail p{color:var(--ink-soft);font-size:.94rem;margin:0;}
+  .detail .kb-row{font-size:.82rem;color:var(--ink-faint);margin-top:auto;padding-top:10px;border-top:1px dashed var(--line);}
+  .detail .opt{border-left:2px solid var(--line);padding-left:12px;margin-top:2px;}
+  .detail .opt + .opt{margin-top:10px;}
+  .detail .opt .who{font-family:var(--font-mono);font-size:.72rem;color:var(--accent);letter-spacing:.05em;}
+
+  /* ---------- reference board ---------- */
+  .board{padding-block:8px 40px;}
+  .board > h2{font-size:1.6rem;margin-bottom:4px;}
+  .board > .lede{color:var(--ink-soft);font-size:.92rem;max-width:62ch;margin:0 0 22px;}
+
+  .group{margin-bottom:28px;}
+  .group-head{
+    display:flex;align-items:baseline;gap:10px;
+    font-family:var(--font-display);font-size:1.2rem;letter-spacing:.03em;
+    color:var(--ink);border-bottom:2px solid var(--line);padding-bottom:6px;margin-bottom:10px;
+  }
+  .group-head .n{
+    font-family:var(--font-mono);font-size:.72rem;color:var(--ink-faint);letter-spacing:.06em;
+  }
+  .rows{display:flex;flex-direction:column;}
+  .row{
+    display:grid;
+    grid-template-columns:150px 1fr 200px;
+    gap:16px;
+    padding-block:12px;
+    border-bottom:1px solid var(--line);
+    align-items:start;
+  }
+  .row:last-child{border-bottom:none;}
+  .row .who{
+    font-family:var(--font-mono);font-size:.85rem;font-weight:500;color:var(--accent);
+    display:flex;flex-direction:column;gap:2px;
+  }
+  .row .who .kb{color:var(--ink-faint);font-size:.78rem;}
+  .row .what p{margin:0;font-size:.92rem;}
+  .row .what .cmdline{
+    font-family:var(--font-mono);font-size:.78rem;color:var(--ink);
+    background:var(--surface-2);display:inline-block;padding:2px 8px;border-radius:4px;margin-bottom:6px;
+  }
+  .row .meta{font-size:.78rem;color:var(--ink-faint);text-align:right;}
+  .row .meta .b{display:inline-block;margin-bottom:4px;}
+
+  .callout{
+    background:var(--surface);border:1px solid var(--line);border-left:3px solid var(--accent-bright);
+    border-radius:var(--radius-m);padding:16px 18px;font-size:.88rem;color:var(--ink-soft);margin-top:8px;
+  }
+  .callout strong{color:var(--ink);}
+  .callout.alert{border-left-color:var(--danger);background:var(--danger-soft);color:var(--ink);}
+  .callout.alert strong{color:var(--danger);}
+  .callout.alert .stamp{
+    display:inline-block;font-size:.7rem;letter-spacing:.08em;text-transform:uppercase;
+    color:var(--danger);border:1px solid var(--danger);border-radius:999px;padding:1px 8px;margin-bottom:8px;
+  }
+
+  footer{border-top:2px solid var(--line);padding-block:20px 40px;color:var(--ink-faint);font-size:.8rem;}
+  footer code{background:var(--surface-2);padding:1px 6px;border-radius:4px;}
+
+  @media (max-width:760px){
+    .console{grid-template-columns:1fr;}
+    .row{grid-template-columns:1fr;gap:6px;}
+    .row .meta{text-align:left;}
+    .topbar{align-items:flex-start;}
+  }
+</style>
+
+<main>
+  <div class="topbar">
+    <div>
+      <span class="eyebrow">RoboJuDo &middot; g1_unified_loco_kick</span>
+      <h1>Sideline Controls</h1>
+      <p class="sub">Every button on the pad, what it fires, and what it needs to be listening.</p>
+    </div>
+    <div class="mode-switch" role="radiogroup" aria-label="Controller">
+      <button class="mode-btn" id="mode-sim" aria-pressed="true">Sim<small>Generic gamepad</small></button>
+      <button class="mode-btn" id="mode-real" aria-pressed="false">Real<small>Unitree remote</small></button>
+    </div>
+  </div>
+
+  <div class="callout alert">
+    <span class="stamp">Changed 2026-09-18</span><br>
+    <strong>Every stop is now the guard pose.</strong> <kbd>A</kbd>/<kbd>Esc</kbd>, <kbd>Select</kbd>/<kbd>I</kbd> and <kbd>Start</kbd>/<kbd>G</kbd> all do the same thing: legs and waist cut to zero stiffness at once, arms drive to the overhead head-guard pose over ~0.4s and hold. The old behaviours are gone &mdash; <code>[SHUTDOWN]</code> is no longer a raw unconditional torque cut, and <code>[SOFT_STOP]</code> no longer does a gentle ramp with the arms left alone.
+    <br><br>
+    The trade accepted in doing that: the guard pose is held by re-pushing gains every tick, so unlike the old <code>[SHUTDOWN]</code> it <strong>depends on the control loop still running</strong>. If the process dies or freezes mid-ramp, gains stay frozen where they were rather than dropping to zero. There is no raw torque-cut binding left on the pad.
+    <br><br>
+    <strong>Automatic fall detection is off on real hardware.</strong> <code>do_safety_check</code> is <code>False</code> everywhere now, so nothing stops the robot on its own &mdash; stopping it is entirely the operator's call using the buttons below.
+  </div>
+
+  <section class="console">
+    <div class="pad-wrap">
+      <div class="cap"><span>Layout</span><span id="cap-mode">Xbox-style, SDL / JoystickCtrl</span></div>
+      <svg class="pad" viewBox="0 0 440 270" role="img" aria-label="Interactive gamepad diagram">
+        <g class="pad-body">
+          <rect x="55" y="55" width="330" height="140" rx="46"></rect>
+          <circle cx="78" cy="188" r="58"></circle>
+          <circle cx="362" cy="188" r="58"></circle>
+        </g>
+
+        <!-- shoulders -->
+        <g class="zone" id="z-lb" data-zone="LB" tabindex="0" role="button" aria-label="Left bumper, hold for aim and navigation">
+          <rect x="46" y="18" width="92" height="24" rx="7"></rect>
+          <text class="fill-label" x="92" y="31" id="lbl-lb">LB</text>
+        </g>
+        <g class="zone" id="z-rb" data-zone="RB" tabindex="0" role="button" aria-label="Right bumper, hold for kick controls">
+          <rect x="302" y="18" width="92" height="24" rx="7"></rect>
+          <text class="fill-label" x="348" y="31" id="lbl-rb">RB</text>
+        </g>
+
+        <!-- d-pad -->
+        <g class="zone" id="z-dup" data-zone="dpad-up" tabindex="0" role="button" aria-label="D-pad up">
+          <rect x="126" y="90" width="26" height="26" rx="5"></rect>
+          <text class="fill-label" x="139" y="104">&#9650;</text>
+        </g>
+        <g class="zone" id="z-ddown" data-zone="dpad-down" tabindex="0" role="button" aria-label="D-pad down">
+          <rect x="126" y="146" width="26" height="26" rx="5"></rect>
+          <text class="fill-label" x="139" y="160">&#9660;</text>
+        </g>
+        <g class="zone" id="z-dleft" data-zone="dpad-left" tabindex="0" role="button" aria-label="D-pad left">
+          <rect x="98" y="118" width="26" height="26" rx="5"></rect>
+          <text class="fill-label" x="111" y="132">&#9664;</text>
+        </g>
+        <g class="zone" id="z-dright" data-zone="dpad-right" tabindex="0" role="button" aria-label="D-pad right">
+          <rect x="154" y="118" width="26" height="26" rx="5"></rect>
+          <text class="fill-label" x="167" y="132">&#9654;</text>
+        </g>
+        <circle cx="139" cy="131" r="3" fill="var(--pad-line)"></circle>
+
+        <!-- select / start -->
+        <g class="zone" id="z-select" data-zone="select" tabindex="0" role="button" aria-label="Select button, real remote only">
+          <rect x="196" y="138" width="26" height="12" rx="6"></rect>
+          <text class="fill-label" x="209" y="145" style="font-size:7px;">SEL</text>
+        </g>
+        <g class="zone" id="z-start" data-zone="start" tabindex="0" role="button" aria-label="Start button, real remote only">
+          <rect x="228" y="138" width="26" height="12" rx="6"></rect>
+          <text class="fill-label" x="241" y="145" style="font-size:7px;">STR</text>
+        </g>
+
+        <!-- face buttons -->
+        <g class="zone" id="z-y" data-zone="btn-y" tabindex="0" role="button" aria-label="Y button, unused">
+          <circle cx="309" cy="95" r="15"></circle>
+          <text class="fill-label" x="309" y="96">Y</text>
+        </g>
+        <g class="zone" id="z-x" data-zone="btn-x" tabindex="0" role="button" aria-label="X button">
+          <circle cx="278" cy="126" r="15"></circle>
+          <text class="fill-label" x="278" y="127">X</text>
+        </g>
+        <g class="zone" id="z-b" data-zone="btn-b" tabindex="0" role="button" aria-label="B button">
+          <circle cx="340" cy="126" r="15"></circle>
+          <text class="fill-label" x="340" y="127">B</text>
+        </g>
+        <g class="zone" id="z-a" data-zone="btn-a" tabindex="0" role="button" aria-label="A button, emergency stop">
+          <circle cx="309" cy="157" r="15"></circle>
+          <text class="fill-label" x="309" y="158">A</text>
+        </g>
+
+        <!-- sticks -->
+        <g class="zone" id="z-stickl" data-zone="stick-l" tabindex="0" role="button" aria-label="Left stick, move">
+          <circle class="stick-ring" cx="112" cy="212" r="27"></circle>
+          <circle cx="112" cy="212" r="17"></circle>
+          <text class="fill-label" x="112" y="213" style="font-size:7.5px;">MOVE</text>
+        </g>
+        <g class="zone" id="z-stickr" data-zone="stick-r" tabindex="0" role="button" aria-label="Right stick, turn">
+          <circle class="stick-ring" cx="330" cy="212" r="27"></circle>
+          <circle cx="330" cy="212" r="17"></circle>
+          <text class="fill-label" x="330" y="213" style="font-size:7.5px;">TURN</text>
+        </g>
+      </svg>
+      <p class="hint">Hold <kbd>LB</kbd> or <kbd>RB</kbd> to see their combos light up &mdash; tap any button for details.</p>
+    </div>
+
+    <aside class="detail" id="detail" aria-live="polite"></aside>
+  </section>
+
+  <section class="board">
+    <h2>Full control sheet</h2>
+    <p class="lede">The same bindings as the diagram above, always on screen. Keyboard equivalents (RoboJuDo also runs off a plain keyboard) are listed under each control.</p>
+    <div id="groups"></div>
+
+    <div class="callout">
+      <strong>Different config, same RB+X-adjacent keys:</strong> in <code>g1_unified_loco_kick_amo</code> (the AMO hand-off build, not the default one mapped above), <kbd>RB</kbd>+D-pad Left/Right switch <code>[POLICY_SWITCH]</code> between AMO and the unified policy. That's a separate feature from Cycle Skill &mdash; the default config keeps Cycle Skill on <kbd>RB</kbd>+X specifically so the two never collide.
+    </div>
+  </section>
+
+  <footer>
+    <p>Sim reads a generic USB/Bluetooth pad via SDL (<code>JoystickCtrl</code>). On the real G1 the onboard Unitree remote is used instead (<code>UnitreeCtrl</code>) &mdash; same layout, <kbd>LB</kbd>/<kbd>RB</kbd> just arrive as <kbd>L1</kbd>/<kbd>R1</kbd> on the wire, which is all the Sim/Real switch above relabels.</p>
+    <p>In sim, a stop no longer closes the viewer &mdash; the window stays open with the robot held in the guard pose. <kbd>Ctrl</kbd>+<kbd>C</kbd> in the terminal is how you actually exit. The sim-only keyboard stops <kbd>P</kbd>/<kbd>O</kbd>/<kbd>R</kbd> were folded into the same guard pose too, so they are now exact duplicates of <kbd>G</kbd>.</p>
+    <p>How firmly the arms reach the pose is tunable per run without editing anything: <code>--guard-arm-kp</code> / <code>--guard-arm-kd</code> on <code>run_pipeline_prepared.py</code> (default <code>20</code>/<code>2</code>). The default is deliberately weak so an arm meeting the ground or an obstruction doesn't transmit full force; raising it trades that protection for a pose that lands faster and more completely, which matters most when the stop is hit mid-kick-strike.</p>
+  </footer>
+</main>
+
+<script>
+(function(){
+  "use strict";
+
+  var CONTROLS = [
+    {zone:"stick-l", group:"move", label:"Left Stick", combo:null, cmd:null, kind:"Analog", kb:"W A S D",
+      desc:"Forward/back and strafe left/right. Rate-limited into the commanded velocity (about a 0.5s ramp up, a slower ramp down) rather than snapping instantly."},
+    {zone:"stick-r", group:"move", label:"Right Stick", combo:null, cmd:null, kind:"Analog", kb:"Q / E",
+      desc:"Turns the robot (yaw). On keyboard this config maps Q to turn right and E to turn left — reversed from the usual convention, worth knowing before you reach for it by feel."},
+
+    {zone:"dpad-up", group:"kick", label:"D-pad Up", combo:"RB", cmd:"[TRIGGER_KICK]", kind:"Trigger", kb:"K",
+      desc:"Kicks whichever skill is currently selected (see Cycle Skill below). It never fires on its own."},
+    {zone:"dpad-down", group:"kick", label:"D-pad Down", combo:"RB", cmd:"[RETURN_TO_LOCO]", kind:"Trigger", kb:"L",
+      desc:"Manual return to locomotion. The kick also auto-returns by itself once the clip finishes — this is the override."},
+    {zone:"btn-x", group:"kick", label:"X", combo:"RB", cmd:"[CYCLE_KICK_SKILL]", kind:"Trigger", kb:"J",
+      desc:"Advances the pending skill (0→1→…→N−1→0). Doesn't kick by itself and is safe to press mid-kick. No-op on a single-skill checkpoint.",
+      note:"Fires a one-shot left-arm wave if skill_cycle_gesture_enabled."},
+    {zone:"btn-b", group:"kick", label:"B", combo:"RB", cmd:"[TOGGLE_READY_GESTURE]", kind:"Toggle", kb:"B",
+      desc:"Toggles a continuous right-arm swing that plays while the ball sits inside the selected skill's own trained box — a lined-up signal for the operator. Starts OFF.",
+      note:"Needs --live-ball and ready_gesture_enabled."},
+
+    {zone:"dpad-left", group:"aim", label:"D-pad Left", combo:"LB", cmd:"[KICK_AIM_THETA_INC]", kind:"Trigger", kb:",",
+      desc:"Aims the kick further LEFT, clamped to this checkpoint's own trained range (±15° on the current default checkpoint)."},
+    {zone:"dpad-right", group:"aim", label:"D-pad Right", combo:"LB", cmd:"[KICK_AIM_THETA_DEC]", kind:"Trigger", kb:".",
+      desc:"Aims the kick further RIGHT, same clamp as the left nudge."},
+    {zone:"dpad-down", group:"aim", label:"D-pad Down", combo:"LB", cmd:"[KICK_AIM_THETA_RESET]", kind:"Trigger", kb:"0",
+      desc:"Resets the aim to 0° — straight along the skill's own calibrated nominal bearing."},
+    {zone:"dpad-up", group:"aim", label:"D-pad Up", combo:"LB", cmd:"[TOGGLE_AUTONAV]", kind:"Toggle", kb:"N",
+      desc:"Toggles auto-navigation: the policy drives itself into the kicking zone, then holds. It never fires the kick itself — that's still on you.",
+      note:"Cancelled instantly by any manual stick input or a lost ball reading. Starts OFF."},
+
+    {zone:"btn-a", group:"stop", label:"A", combo:null, cmd:"[SHUTDOWN]", kind:"E-stop", kb:"Esc",
+      desc:"Guard-pose stop. Legs and waist cut to zero stiffness immediately; the arms drive to an overhead head-guard pose over ~0.4s and hold it there.",
+      note:"Changed 2026-09-18: this was a raw, unconditional torque cut. It now holds the pose by re-pushing gains every tick, so it depends on the control loop still running — if the process dies mid-ramp, gains freeze where they were instead of dropping to zero. One-way: recovering needs a process restart."},
+    {zone:"select", group:"stop", label:"Select", combo:null, cmd:"[SOFT_STOP]", kind:"Real only", kb:"I", realOnly:true,
+      desc:"Identical to A and Start — the same guard-pose stop.",
+      note:"Changed 2026-09-18: used to be a gentle ~1.5s torque fade with no arm motion. The ramp is gone; every stop now goes to the guard pose."},
+    {zone:"start", group:"stop", label:"Start", combo:null, cmd:"[GUARD_STOP]", kind:"Real only", kb:"G", realOnly:true,
+      desc:"Legs go limp while the arms actively drive to — and hold — an overhead head-guard pose.",
+      note:"Unchanged — but A and Select now do exactly this too, so all three stops land in the same place."},
+
+    {zone:"btn-y", group:"unused", label:"Y", combo:null, cmd:null, kind:"Unused", kb:null, desc:"Not bound in this config."}
+  ];
+
+  var GROUP_META = {
+    move:{title:"Move", n:"01"},
+    kick:{title:"Kick — hold RB", n:"02"},
+    aim:{title:"Aim & navigate — hold LB", n:"03"},
+    stop:{title:"Stop", n:"04"}
+  };
+
+  var zonesEl = {};
+  document.querySelectorAll(".zone").forEach(function(el){
+    var z = el.getAttribute("data-zone");
+    (zonesEl[z] = zonesEl[z] || []).push(el);
+  });
+
+  var mode = "sim"; // "sim" | "real"
+  var armed = null; // "LB" | "RB" | null
+  var pinned = null; // zone key, sticky selection
+  var detail = document.getElementById("detail");
+
+  function actionsFor(zone){
+    return CONTROLS.filter(function(c){ return c.zone === zone; });
+  }
+
+  function comboLabel(combo){
+    if (!combo) return null;
+    if (mode === "real") return combo === "LB" ? "L1" : "R1";
+    return combo;
+  }
+
+  function renderDetail(zone){
+    var actions = actionsFor(zone);
+    if (!actions.length){ return; }
+    var visible = actions;
+    if (armed) visible = actions.filter(function(a){ return !a.combo || a.combo === armed; });
+    if (!visible.length) visible = actions;
+
+    var html = "";
+    if (visible.length === 1){
+      var a = visible[0];
+      html += '<span class="d-eyebrow">' + (a.combo ? (comboLabel(a.combo) + " + " + a.label) : a.label) + '</span>';
+      html += "<h2>" + a.kind + (a.cmd ? "" : "") + "</h2>";
+      html += '<div class="badges">';
+      if (a.cmd) html += '<span class="badge cmd">' + a.cmd + '</span>';
+      html += '<span class="badge">' + a.kind + '</span>';
+      if (a.realOnly) html += '<span class="badge warn">Real remote only</span>';
+      html += "</div>";
+      html += "<p>" + a.desc + "</p>";
+      if (a.note) html += '<p style="color:var(--ink-faint);font-size:.84rem;">' + a.note + "</p>";
+      html += '<div class="kb-row">' + (a.kb ? ("Keyboard: <kbd>" + a.kb + "</kbd>") : "No keyboard equivalent") + "</div>";
+    } else {
+      html += '<span class="d-eyebrow">' + visible[0].label + " — depends on what you're holding</span>";
+      html += "<h2>Two jobs</h2>";
+      visible.forEach(function(a){
+        html += '<div class="opt"><div class="who">Hold ' + comboLabel(a.combo) + "</div>";
+        html += '<span class="badge cmd" style="margin:4px 0;display:inline-block;">' + a.cmd + "</span>";
+        html += "<p>" + a.desc + "</p></div>";
+      });
+    }
+    detail.innerHTML = html;
+  }
+
+  function renderDefault(){
+    detail.innerHTML =
+      '<span class="d-eyebrow">How to read the pad</span>' +
+      "<h2>Hold, then tap</h2>" +
+      "<p>Most of this pad only does something while a shoulder button is held — exactly like the physical remote. Hold <kbd>" + comboLabel("RB") + "</kbd> for kick controls, or <kbd>" + comboLabel("LB") + "</kbd> for aim and navigation, and the buttons that apply will light up amber.</p>" +
+      "<p>Left stick drives, right stick turns, and <kbd>A</kbd> is always the emergency stop, held or not.</p>" +
+      '<div class="kb-row">Tap any control on the pad, or scroll to the sheet below.</div>';
+  }
+
+  function updateLitStates(){
+    Object.keys(zonesEl).forEach(function(z){
+      var actions = actionsFor(z);
+      var els = zonesEl[z];
+      var isArmedButton = (z === "LB" || z === "RB");
+      els.forEach(function(el){ el.classList.remove("lit","dim","armed","pinned","unbound"); });
+
+      if (!actions.length){ return; }
+      if (actions.every(function(a){ return a.cmd === null; })){
+        els.forEach(function(el){ el.classList.add("unbound"); });
+        return;
+      }
+      if (actions.some(function(a){ return a.realOnly; }) && mode === "sim"){
+        els.forEach(function(el){ el.classList.add("unbound"); });
+        return;
+      }
+
+      var lit;
+      if (!armed){
+        lit = true; // resting state: everything bound looks live
+      } else {
+        lit = actions.some(function(a){ return !a.combo || a.combo === armed; });
+      }
+      els.forEach(function(el){
+        el.classList.toggle("lit", lit);
+        el.classList.toggle("dim", !lit);
+        el.classList.toggle("pinned", pinned === z);
+      });
+    });
+    ["z-lb","z-rb"].forEach(function(id){
+      var el = document.getElementById(id);
+      var which = id === "z-lb" ? "LB" : "RB";
+      el.classList.toggle("armed", armed === which);
+    });
+  }
+
+  function selectZone(zone, opts){
+    opts = opts || {};
+    if (zone === "LB" || zone === "RB"){
+      if (opts.click){
+        armed = (armed === zone) ? null : zone;
+      }
+    }
+    if (opts.click) pinned = zone;
+    renderDetail(pinned || zone);
+    updateLitStates();
+  }
+
+  document.querySelectorAll(".zone").forEach(function(el){
+    var z = el.getAttribute("data-zone");
+    el.addEventListener("mouseenter", function(){ if (!("ontouchstart" in window)) renderDetail(z); updateLitStates(); });
+    el.addEventListener("mouseleave", function(){
+      if (pinned) renderDetail(pinned); else renderDefault();
+      updateLitStates();
+    });
+    el.addEventListener("focus", function(){ renderDetail(z); });
+    el.addEventListener("click", function(){ selectZone(z, {click:true}); });
+    el.addEventListener("keydown", function(e){
+      if (e.key === "Enter" || e.key === " "){ e.preventDefault(); selectZone(z, {click:true}); }
+    });
+  });
+
+  var lbLbl = document.getElementById("lbl-lb");
+  var rbLbl = document.getElementById("lbl-rb");
+  var capMode = document.getElementById("cap-mode");
+  var simBtn = document.getElementById("mode-sim");
+  var realBtn = document.getElementById("mode-real");
+
+  function setMode(next){
+    mode = next;
+    simBtn.setAttribute("aria-pressed", String(mode === "sim"));
+    realBtn.setAttribute("aria-pressed", String(mode === "real"));
+    lbLbl.textContent = mode === "real" ? "L1" : "LB";
+    rbLbl.textContent = mode === "real" ? "R1" : "RB";
+    capMode.textContent = mode === "real" ? "Unitree remote, unitreeRemoteController" : "Xbox-style, SDL / JoystickCtrl";
+    updateLitStates();
+    renderGroups();
+    if (pinned) renderDetail(pinned); else renderDefault();
+  }
+  simBtn.addEventListener("click", function(){ setMode("sim"); });
+  realBtn.addEventListener("click", function(){ setMode("real"); });
+
+  function renderGroups(){
+    var wrap = document.getElementById("groups");
+    var order = ["kick","aim","move","stop"];
+    var html = "";
+    order.forEach(function(g){
+      var meta = GROUP_META[g];
+      var items = CONTROLS.filter(function(c){ return c.group === g && (!c.realOnly || mode === "real"); });
+      if (!items.length) return;
+      html += '<div class="group"><div class="group-head"><span>' + meta.title + '</span><span class="n">' + meta.n + '</span></div><div class="rows">';
+      items.forEach(function(a){
+        var who = a.combo ? (comboLabel(a.combo) + " + " + a.label) : a.label;
+        html += '<div class="row">';
+        html += '<div class="who">' + who + (a.kb ? ('<span class="kb">Key ' + a.kb + '</span>') : '') + '</div>';
+        html += '<div class="what">' + (a.cmd ? ('<span class="cmdline">' + a.cmd + '</span><br>') : '') + '<p>' + a.desc + (a.note ? (' <span style="color:var(--ink-faint)">' + a.note + '</span>') : '') + '</p></div>';
+        html += '<div class="meta"><span class="b">' + a.kind + '</span>' + (a.realOnly ? '<br><span style="color:var(--danger)">Real remote only</span>' : '') + '</div>';
+        html += '</div>';
+      });
+      html += '</div></div>';
+    });
+    wrap.innerHTML = html;
+  }
+
+  renderGroups();
+  renderDefault();
+  updateLitStates();
+})();
+</script>

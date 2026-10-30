@@ -38,3 +38,5 @@ ctrl_registry.add("TwistRedisCtrl", ".twist_redis_ctrl")
 ctrl_registry.add("BallPoseRedisCtrl", ".ball_pose_redis_ctrl")
 ctrl_registry.add("BallPoseRos2Ctrl", ".ball_pose_ros2_ctrl")  # needs ROS2 (rclpy); imported lazily
 ctrl_registry.add("BallPoseUdpCtrl", ".ball_pose_udp_ctrl")  # stdlib-only; no Redis, no ROS2 needed
+ctrl_registry.add("PingPongPerceptionCtrl", ".pingpong_mocap_ctrl")  # table tennis: the perception program's messages (UDP)
+ctrl_registry.add("PingPongSimWorldCtrl", ".pingpong_mocap_ctrl")  # table tennis, sim: the opponent + the simulated OptiTrack cameras

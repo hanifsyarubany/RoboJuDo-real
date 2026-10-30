@@ -15,6 +15,7 @@ import time
 import numpy as np
 import redis
 from redis.exceptions import RedisError
+from scipy.spatial.transform import Rotation as sRot
 
 # import robojudo.pipeline (and therefore torch, via robojudo/__init__.py) BEFORE mujoco. On some
 # platforms (seen on the G1 onboard computer) importing mujoco first exhausts glibc's static TLS
@@ -28,6 +29,7 @@ from robojudo.config.g1.env.g1_holosoma_env_cfg import HOLOSOMA_SCENE_WITH_BALL
 from robojudo.controller.ctrl_cfgs import BallPoseRedisCtrlCfg, BallPoseRos2CtrlCfg, BallPoseUdpCtrlCfg
 from robojudo.pipeline.pipeline_cfgs import RlPipelineCfg
 from robojudo.pipeline.rl_pipeline import RlPipeline
+from robojudo.utils.util_func import calc_heading_quat_np
 
 import mujoco  # noqa: E402 -- see note above; must come after robojudo.pipeline
 
@@ -256,6 +258,66 @@ def parse_args():
         "actually have time to get there.",
     )
     parser.add_argument(
+        "--show-cmd-vel",
+        action="store_true",
+        help="SIM ONLY (no-op on real hardware, which has no viewer). Float the APPLIED locomotion "
+        "command above the robot in the MuJoCo viewer as text -- 'vx+0.42 vy-0.10 wz+0.30' -- plus "
+        "a green heading arrow. These are lin_vel_command/ang_vel_command, i.e. post rate-limiting "
+        "and zero-snap: what the network is actually being fed, not the raw stick position, so it "
+        "also shows the decel ramp after you let go. Omit for no overlay at all.",
+    )
+    parser.add_argument(
+        "--cmd-log-hz",
+        type=float,
+        default=0.0,
+        help="Log the same applied locomotion command (vx/vy/wz) to the terminal at this rate (Hz). "
+        "Unlike --show-cmd-vel this works on REAL hardware too, since it is just a log line. "
+        "Default 0 disables it entirely.",
+    )
+    parser.add_argument(
+        "--aim-compass-gui",
+        action="store_true",
+        help="Open a separate tkinter window drawing the kick aim as a real 360-degree compass: the "
+        "trained kick_aim_theta band as a wedge, the selected skill's nominal shot bearing, and a "
+        "live needle at nominal + your current aim, with a numeric readout. Forward is UP, the "
+        "robot's left is LEFT. Updated live as you press ','/'.'/'0' and cycle skills with 'j'. "
+        "Needs a display (DISPLAY set); it warns and carries on headless rather than failing the "
+        "run. Unlike --show-aim-compass this is a proper GUI window, not markers drawn on the "
+        "ground -- the two are independent and can be used together or separately.",
+    )
+    parser.add_argument(
+        "--aim-compass-scale",
+        type=float,
+        default=1.0,
+        help="Only used with --aim-compass-gui. DPI/resolution factor for the compass window: it "
+        "multiplies EVERY pixel dimension -- canvas, ring radius, line widths and font sizes -- so "
+        "the widget is genuinely drawn at higher resolution rather than being a small window "
+        "stretched by the window manager. Default 1.0 (compact, 340x416); raise it on a HiDPI "
+        "screen -- 2.0 gives 680x832, 3.0 gives 1020x1248.",
+    )
+    parser.add_argument(
+        "--show-aim-compass",
+        action="store_true",
+        help="SIM ONLY (no-op on real hardware, which has no viewer). Draw a 360-degree ring flat "
+        "on the ground around the robot showing, for the CURRENTLY SELECTED kick skill: its nominal "
+        "shot bearing (green, labelled), the trained kick_aim_theta band around that nominal "
+        "(orange arc, width read per-skill from the checkpoint's own kick_aim_theta_max_deg), and a "
+        "live magenta needle at nominal + your current aim, driven by the ','/'.'/'0' keys. The ring "
+        "rotates with the robot, and a brighter 'fwd' tick marks the robot's own forward. Cycling "
+        "skills ('j'/RB+X) re-draws it for the newly selected skill. NOTE: the needle only MOVES if "
+        "the policy cfg has manual_kick_aim_enabled -- otherwise kick_aim_theta stays 0 and the "
+        "needle simply sits on the nominal.",
+    )
+    parser.add_argument(
+        "--auto-respawn-ball",
+        action="store_true",
+        help="SIM + --live-ball only. Restores the OLD default (pre-2026-09-21): automatically "
+        "teleport the ball back to the skill's nominal spawn every time a kick ends (kick clip "
+        "finishes, or [RETURN_TO_LOCO]). Omit this and the ball just stays wherever physics left it "
+        "after being kicked -- use [RESPAWN_BALL] (keyboard 'm') to reset it manually instead, "
+        "whenever you actually want to. See BallRespawner's own docstring for the full history.",
+    )
+    parser.add_argument(
         "--guard-arm-kp",
         type=float,
         default=None,
@@ -338,23 +400,48 @@ def parse_args():
     return args
 
 
-class BallRespawner:
-    """--live-ball only: teleports the physical MuJoCo ball back to a nominal spawn position every
-    time a kick ends (auto-return-after-clip-finishes, or a manual [RETURN_TO_LOCO]), so the NEXT
-    kick -- whether it repeats the same skill or a different one via [CYCLE_KICK_SKILL]/`j` -- always
-    starts from an in-distribution ball position, matching training's per-episode ball reset. Without
-    this, the ball just stays wherever physics left it after being kicked (often far downfield, near
-    the target) -- badly out-of-distribution for the next kick, and the actual cause of "robust the
-    1st time, falls the 2nd" reports (confirmed: [CYCLE_KICK_SKILL] itself never touches env state --
-    see unified_loco_kick_policy.py's docstring -- so this was never a cycling bug).
+def _robot_frame_to_world_xy(env, local_x: float, local_y: float) -> tuple[float, float]:
+    """Transform a (forward, left) offset in the robot's CURRENT heading frame -- yaw-only, the
+    same "_b"-suffixed convention as kick_ball_pos_b and every live perception reading (see
+    scripts/dummy_ball_perception.py: "rotated into the robot's heading frame") -- into world (x,
+    y), using the robot's base position/orientation AT THE MOMENT this is called. Deliberately NOT
+    "at reset" or "at spawn" -- the whole point is this stays correct after the robot has walked
+    and turned away from wherever it started."""
+    heading_quat = calc_heading_quat_np(np.asarray(env.base_quat))
+    offset_world = sRot.from_quat(heading_quat).apply([local_x, local_y, 0.0])
+    base_pos = np.asarray(env.base_pos)
+    return float(base_pos[0] + offset_world[0]), float(base_pos[1] + offset_world[1])
 
-    Detects the kick-end transition by polling `inner_policy.task_mode` tick-to-tick (same pattern
-    DryRunSafetyMonitor already uses for the same field) rather than adding an event/callback to
-    UnifiedLocoKickPolicy itself, which stays environment-agnostic (it never touches env.data/model,
-    so it also works unmodified against real hardware, where there's obviously nothing to teleport).
+
+class BallRespawner:
+    """--live-ball only: teleports the physical MuJoCo ball to a skill's nominal spawn position.
+
+    Two trigger paths:
+      - respawn_now(): MANUAL, via [RESPAWN_BALL] (keyboard 'm' in sim -- see
+        g1_unified_loco_kick_cfg.py). The default path since 2026-09-21 (operator decision): the
+        ball is left wherever physics puts it after a kick until you explicitly ask for a reset.
+      - check_and_respawn(): AUTOMATIC, on the kick-end (kick -> locomotion) transition. OFF by
+        default since 2026-09-21 -- opt back in with --auto-respawn-ball. Originally built because
+        leaving the ball wherever it rolled after a kick (often far downfield) put the NEXT kick
+        badly out-of-distribution relative to training's per-episode ball reset, and was the actual
+        cause of "robust the 1st time, falls the 2nd" reports -- [CYCLE_KICK_SKILL] itself never
+        touches env state (see unified_loco_kick_policy.py's docstring), so that was never a
+        cycling bug. Detects the transition by polling `inner_policy.task_mode` tick-to-tick (same
+        pattern DryRunSafetyMonitor uses).
+
+    Position: the target skill's nominal ball (x, y) -- get_skill_ball_xy() -- is defined in the
+    robot's OWN heading frame (forward=+x, left=+y), not a world position; see
+    _robot_frame_to_world_xy's docstring for the exact convention and why. It is transformed to
+    world coordinates using the robot's CURRENT pose at respawn time -- NOT wherever the robot
+    happened to be standing earlier. (The training-side mujoco_kick_rollout_worker.py writes this
+    same value straight into a world qpos, but only because IT always places the robot at world
+    origin first -- that's a property of that caller's own reset convention, not evidence this is a
+    world-frame quantity in general.) Checkpoints with no skill_ball_xy metadata fall back to
+    DEFAULT_BALL_XY, which genuinely IS a fixed world position (the scene file's own keyframe spawn)
+    and is used unrotated, exactly as before.
     """
 
-    DEFAULT_BALL_XY = (1.3, 0.0)  # scene_g1_29dof_with_ball.xml's own ball body spawn (x, y)
+    DEFAULT_BALL_XY = (1.3, 0.0)  # scene_g1_29dof_with_ball.xml's own ball body spawn -- WORLD frame
     BALL_Z = 0.11  # ball radius -- resting exactly on the floor, same as the scene's spawn/keyframe
 
     def __init__(self, pipeline, ball_qpos_addr: int, ball_qvel_addr: int):
@@ -365,15 +452,24 @@ class BallRespawner:
         self._prev_task_mode = self.inner_policy.task_mode
 
     def check_and_respawn(self):
+        """AUTOMATIC path -- only ever called if --auto-respawn-ball is passed."""
         task_mode = self.inner_policy.task_mode
         if self._prev_task_mode == "kick" and task_mode == "locomotion":
-            self._respawn()
+            self._respawn(self.inner_policy.kick_skill_id, reason="kick ended")
         self._prev_task_mode = task_mode
 
-    def _respawn(self):
-        skill_id = self.inner_policy.kick_skill_id
-        xy = self.inner_policy.get_skill_ball_xy(skill_id)
-        x, y = xy if xy is not None else self.DEFAULT_BALL_XY
+    def respawn_now(self):
+        """MANUAL path -- [RESPAWN_BALL]. Uses the PENDING skill selection (whatever
+        [CYCLE_KICK_SKILL] last left selected), since kick_skill_id is only meaningful mid-kick and
+        this can be pressed at any time, including standing in plain locomotion."""
+        self._respawn(self.inner_policy.pending_skill_id, reason="manual respawn")
+
+    def _respawn(self, skill_id: int, reason: str):
+        local_xy = self.inner_policy.get_skill_ball_xy(skill_id)
+        if local_xy is not None:
+            x, y = _robot_frame_to_world_xy(self.env, local_xy[0], local_xy[1])
+        else:
+            x, y = self.DEFAULT_BALL_XY  # already world-frame -- no transform
 
         addr = self.ball_qpos_addr
         self.env.data.qpos[addr : addr + 3] = [x, y, self.BALL_Z]
@@ -383,7 +479,7 @@ class BallRespawner:
 
         mujoco.mj_forward(self.env.model, self.env.data)
         self.env.update()
-        logger.info(f"[live-ball] kick ended (skill {skill_id}) -- respawned ball at ({x:.2f}, {y:.2f}, {self.BALL_Z:.2f})")
+        logger.info(f"[live-ball] {reason} (skill {skill_id}) -- respawned ball at ({x:.2f}, {y:.2f}, {self.BALL_Z:.2f})")
 
 
 _BALL_CTRL_TYPE_BY_SOURCE = {"redis": "BallPoseRedisCtrl", "ros2": "BallPoseRos2Ctrl", "udp": "BallPoseUdpCtrl"}
@@ -585,6 +681,20 @@ def main():
         cfg.env.foot_floor_friction = args.sim_foot_floor_friction
         logger.warning(f"[sim2sim] overriding foot<->floor friction to {args.sim_foot_floor_friction} "
                        "(scene default is 0.8) -- see --sim-foot-floor-friction's own help for why.")
+
+    if args.show_cmd_vel:
+        # Set on the cfg BEFORE the pipeline is built -- the policy reads it in __init__.
+        if not cfg.env.is_sim:
+            logger.warning(
+                "--show-cmd-vel has no effect on real hardware (no viewer to draw into); "
+                "use --cmd-log-hz instead to get the same numbers as log lines."
+            )
+        cfg.policy.show_cmd_vel_overlay = True
+
+    if args.show_aim_compass:
+        if not cfg.env.is_sim:
+            logger.warning("--show-aim-compass has no effect on real hardware (no viewer to draw into).")
+        cfg.policy.show_aim_compass = True
 
     if args.sim_test_real_safety_check:
         if not cfg.env.is_sim:
@@ -823,6 +933,17 @@ def main():
 
     _robot_pose_publish_failing = False  # throttle: warn once per failure streak, not every tick
     _last_ball_log_t = 0.0
+    _last_cmd_log_t = 0.0
+
+    aim_compass_gui = None
+    if args.aim_compass_gui:
+        from robojudo.utils.aim_compass_gui import AimCompassGUI
+
+        aim_compass_gui = AimCompassGUI(scale=args.aim_compass_scale)
+        logger.warning(
+            f"[aim-compass] compass window requested at scale {args.aim_compass_scale:.2f} "
+            "(--aim-compass-scale) -- see --aim-compass-gui's own help for the layout."
+        )
 
     _stall_watchdog_file = None
     if args.stall_watchdog_s > 0:
@@ -859,10 +980,32 @@ def main():
         pipeline.step(dry_run=args.dry_run)
         if safety_monitor is not None:
             safety_monitor.check_and_log()
-        if ball_respawner is not None and not args.dry_run:
+        if aim_compass_gui is not None:
+            # Cheap by contract -- one dict rebind, no lock, no draw. See AimCompassGUI's
+            # threading note: the compass must never be able to stall this loop.
+            aim_compass_gui.update(pipeline.policy.policy.get_aim_state())
+
+        if "[RESPAWN_BALL]" in getattr(pipeline, "last_commands", ()):
+            if ball_respawner is not None and not args.dry_run:
+                ball_respawner.respawn_now()
+            elif ball_respawner is None:
+                logger.warning("[RESPAWN_BALL] pressed but there's no ball to respawn -- needs --live-ball with a scene that has one.")
+            # else: --dry-run applies no torque, so silently doing nothing here matches "nothing
+            # physically moves" -- unlike the warning above, this isn't a misconfiguration.
+
+        if ball_respawner is not None and not args.dry_run and args.auto_respawn_ball:
             # --dry-run applies no torque (env.step() skipped) -- teleporting the ball there would
             # still visibly move it despite "nothing physically moves" being the documented contract.
             ball_respawner.check_and_respawn()
+
+        if args.cmd_log_hz > 0 and time_start - _last_cmd_log_t >= (1.0 / args.cmd_log_hz):
+            _last_cmd_log_t = time_start
+            _pol = pipeline.policy.policy  # unwrap PolicyWrapper -> UnifiedLocoKickPolicy
+            _lin, _ang = _pol.lin_vel_command, _pol.ang_vel_command
+            logger.info(
+                f"[cmd-vel] vx={float(_lin[0]):+.3f} vy={float(_lin[1]):+.3f} wz={float(_ang):+.3f} "
+                f"(m/s, m/s, rad/s)  task_mode={_pol.task_mode}"
+            )
 
         if ball_ctrl_inst is not None and time_start - _last_ball_log_t >= (1.0 / args.ball_log_hz):
             _last_ball_log_t = time_start

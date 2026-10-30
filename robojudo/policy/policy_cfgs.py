@@ -632,6 +632,26 @@ class UnifiedLocoKickPolicyCfg(PolicyCfg):
     # deviation gets -- a safety ceiling, not the normal operating point.
     hip_roll_correction_max_rad: float = 0.15  # ~8.6 deg
 
+    # --- commanded-velocity on-screen readout (sim viewer only) ---
+    # Draw the APPLIED locomotion command (lin_vel_command / ang_vel_command -- i.e. post
+    # rate-limiting and zero-snap, what the network actually receives, not the raw stick) as a text
+    # label floating above the robot, plus a heading arrow. Off by default; turned on per-run by
+    # run_pipeline_prepared.py's --show-cmd-vel. Purely a debug_viz() draw, so it is inert on real
+    # hardware regardless of this flag (UnitreeCppEnv has no visualizer at all) and costs nothing
+    # when the value is False.
+    show_cmd_vel_overlay: bool = False
+    cmd_vel_overlay_height_m: float = 0.45  # how far above base_pos to float the label
+
+    # --- kick-aim compass (sim viewer only) ---
+    # A 360-degree ring drawn flat on the ground around the robot showing, for the CURRENTLY
+    # SELECTED skill: its nominal shot bearing, the trained kick_aim_theta_max_deg band around that
+    # nominal, and a live needle at nominal + the operator's current kick_aim_theta (','/'.'/'0').
+    # Off by default; turned on per-run by run_pipeline_prepared.py's --show-aim-compass. Like the
+    # cmd-vel overlay this is a debug_viz() draw only, so it is inert on real hardware regardless.
+    show_aim_compass: bool = False
+    aim_compass_radius_m: float = 1.2  # ring radius around the robot's base
+    aim_compass_height_m: float = 0.02  # lift off the floor so it doesn't z-fight the ground plane
+
     # --- manual kick_aim_theta override (operator dials aim from THIS process's own controller) ---
     # When ENABLED, kick_target_pos_b is computed INTERNALLY every tick as [kick_aim_theta /
     # kick_aim_theta_ref_deg, 0.0] from an operator-held angle the controller nudges -- instead of

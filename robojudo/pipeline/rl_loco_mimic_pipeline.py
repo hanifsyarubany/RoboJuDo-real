@@ -212,6 +212,7 @@ class RlLocoMimicPipeline(RlMultiPolicyPipeline):
         self.timestep += 1
 
         commands = ctrl_data.get("COMMANDS", [])
+        self.last_commands = commands  # see RlPipeline.post_step_callback's comment on this
 
         # Handle policy CALLBACK
         for callback in extras.get("CALLBACK", []):

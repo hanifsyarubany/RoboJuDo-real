@@ -173,7 +173,7 @@ from scipy.spatial.transform import Rotation as sRot
 from robojudo.policy import Policy, policy_registry
 from robojudo.policy.policy_cfgs import UnifiedLocoKickPolicyCfg
 from robojudo.tools.dof import DoFConfig
-from robojudo.utils.util_func import command_remap
+from robojudo.utils.util_func import calc_heading_quat_np, command_remap
 
 logger = logging.getLogger(__name__)
 
@@ -402,6 +402,16 @@ class UnifiedLocoKickPolicy(Policy):
                     "[UnifiedLocoKick] skill_cycle_gesture_enabled but left_shoulder_pitch_joint/"
                     "left_elbow_joint are not in dof_names -- skill-cycled gesture disabled."
                 )
+
+        # ---- commanded-velocity on-screen readout (sim viewer only, see debug_viz) ----
+        self._show_cmd_vel_overlay = bool(getattr(cfg_policy, "show_cmd_vel_overlay", False))
+        self._cmd_vel_overlay_height_m = float(getattr(cfg_policy, "cmd_vel_overlay_height_m", 0.45))
+
+        # ---- kick-aim compass (sim viewer only, see _draw_aim_compass) ----
+        self._show_aim_compass = bool(getattr(cfg_policy, "show_aim_compass", False))
+        self._aim_compass_radius_m = float(getattr(cfg_policy, "aim_compass_radius_m", 1.2))
+        self._aim_compass_height_m = float(getattr(cfg_policy, "aim_compass_height_m", 0.02))
+        self._aim_compass_warned = False
 
         # ---- hip-roll drift correction (see _apply_hip_roll_correction) ----
         self._hip_roll_correction_enabled = bool(cfg_policy.hip_roll_correction_enabled)
@@ -1267,6 +1277,162 @@ class UnifiedLocoKickPolicy(Policy):
     # ------------------------------------------------------------------ #
     # commands / kick trigger                                            #
     # ------------------------------------------------------------------ #
+    def debug_viz(self, visualizer, env_data, ctrl_data, extras):
+        """Float the APPLIED locomotion command above the robot as text, plus a heading arrow.
+
+        Opt-in via show_cmd_vel_overlay (run_pipeline_prepared.py's --show-cmd-vel). Shows
+        lin_vel_command/ang_vel_command -- the post-rate-limit, post-zero-snap values the network
+        actually receives -- NOT the raw stick, so what you read here is what the policy is being
+        asked to do, including during the command_decel_time ramp after you release the stick.
+
+        Sim-only for free: RlPipeline only calls debug_viz() when self.visualizer is not None, and
+        UnitreeCppEnv never builds one. Nothing here needs a real-hardware guard.
+        """
+        if visualizer is None:
+            return
+        if self._show_aim_compass:
+            self._draw_aim_compass(visualizer, env_data)
+        if not self._show_cmd_vel_overlay:
+            return
+        viewer = getattr(visualizer, "viewer", None)
+        if viewer is None or not hasattr(viewer, "add_marker"):
+            return
+        # Imported HERE, not at module scope: this module is imported on real hardware too, and
+        # run_pipeline_prepared.py documents a real torch-before-mujoco import-order constraint on
+        # the G1's Jetson (static TLS exhaustion). This path only ever runs under MujocoEnv, where
+        # mujoco is already loaded, so the lazy import is free and cannot perturb that ordering.
+        import mujoco
+
+        vx, vy = float(self.lin_vel_command[0]), float(self.lin_vel_command[1])
+        wz = float(self.ang_vel_command)
+        base_pos = np.asarray(env_data["base_pos"], dtype=float)
+        base_quat = env_data["base_quat"]
+
+        # mjvGeom.label is a fixed 100-char buffer -- keep this short so it can't be truncated.
+        label = f"vx{vx:+.2f} vy{vy:+.2f} wz{wz:+.2f}"
+        viewer.add_marker(
+            pos=base_pos + np.array([0.0, 0.0, self._cmd_vel_overlay_height_m]),
+            size=[0.012, 0.012, 0.012],
+            rgba=[1.0, 1.0, 1.0, 0.85],
+            type=mujoco.mjtGeom.mjGEOM_SPHERE,
+            label=label,
+            id=910,  # fixed id so each tick REPLACES this marker instead of accumulating markers
+        )
+        # heading arrow for the linear part, same convention unitree_policy.debug_viz uses
+        if abs(vx) > 1e-3 or abs(vy) > 1e-3:
+            visualizer.draw_arrow(
+                base_pos, base_quat, [vx, vy, 0.0],
+                color=[0.2, 1.0, 0.2, 1.0], scale=1.0, horizontal_only=True, id=911,
+            )
+
+    # --- kick-aim compass --------------------------------------------------------------- #
+    # Fixed marker-id budget. The viewer keys markers by id and keeps them until the SAME id is
+    # written again (mujoco_viewer.add_marker: `self._markers_dict[f'marker_{id}'] = params`), so a
+    # variable number of markers would leave stale ones behind whenever the arc narrows or the
+    # compass is skipped. Every draw therefore writes exactly the same ids every tick, hiding
+    # elements with alpha=0 instead of omitting them.
+    _COMPASS_N_TICKS = 12  # one every 30 degrees
+    _COMPASS_N_ARC = 21  # samples spread across the trained band, whatever its width
+    _COMPASS_TICK_ID0 = 920
+    _COMPASS_ARC_ID0 = 940
+    _COMPASS_NOMINAL_ID = 970
+    _COMPASS_AIM_ID = 971
+    _COMPASS_ARROW_ID = 912  # draw_arrow namespaces its own ids as 3000+id, so no clash with above
+
+    def _compass_ring_pos(self, base_pos, heading_rot, bearing_deg: float, radius: float):
+        """World position of a point on the ring at `bearing_deg` in the ROBOT's frame (0 = the
+        robot's own forward, positive = its left -- the same convention kick_aim_theta itself uses,
+        see this module's docstring)."""
+        rad = np.radians(bearing_deg)
+        local = np.array([radius * np.cos(rad), radius * np.sin(rad), 0.0])
+        return base_pos + heading_rot.apply(local)
+
+    def _draw_aim_compass(self, visualizer, env_data):
+        """360-degree ground ring showing the selected skill's nominal shot bearing, its trained
+        kick_aim_theta band, and a live needle at nominal + the operator's current aim.
+
+        Bearings are all in the ROBOT's frame and rotated into the world by the robot's CURRENT
+        heading, so the ring turns with the robot and the needle always points where the kick would
+        actually go. Nominal comes from the skill's own ball->target metadata
+        (get_skill_ball_xy/get_skill_target_xy, both robot-frame); the band half-width is that
+        skill's own trained kick_aim_theta_max_deg, read per-skill rather than assumed uniform."""
+        viewer = getattr(visualizer, "viewer", None)
+        if viewer is None or not hasattr(viewer, "add_marker"):
+            return
+        import mujoco  # lazy -- see debug_viz's note on the Jetson import-order constraint
+
+        base_pos = np.asarray(env_data["base_pos"], dtype=float).copy()
+        base_pos[2] = self._aim_compass_height_m
+        heading_rot = sRot.from_quat(calc_heading_quat_np(np.asarray(env_data["base_quat"])))
+        radius = self._aim_compass_radius_m
+
+        sid = self._selected_skill_id
+        state = self.get_aim_state()  # shared with the tkinter compass -- see get_aim_state()
+        have_nominal = state is not None
+        if have_nominal:
+            nominal_deg = state["nominal_deg"]
+            max_deg = state["max_deg"]
+            aim_deg = state["aim_deg"]
+        elif not self._aim_compass_warned:
+            self._aim_compass_warned = True
+            logger.warning(
+                f"[UnifiedLocoKick] aim compass: skill {sid} has no skill_ball_xy/skill_target_xy "
+                "metadata, so it has no nominal bearing to draw -- showing the bare ring only."
+            )
+
+        def marker(mid, pos, size, rgba, label=""):
+            viewer.add_marker(
+                pos=pos, size=[size, size, size], rgba=rgba,
+                type=mujoco.mjtGeom.mjGEOM_SPHERE, label=label, id=mid,
+            )
+
+        # 1. the ring itself -- a tick every 30 deg, with the robot's own forward (0 deg) brighter
+        #    and larger so the ring is orientable at a glance.
+        for i in range(self._COMPASS_N_TICKS):
+            bearing = i * (360.0 / self._COMPASS_N_TICKS)
+            is_forward = i == 0
+            marker(
+                self._COMPASS_TICK_ID0 + i,
+                self._compass_ring_pos(base_pos, heading_rot, bearing, radius),
+                0.035 if is_forward else 0.02,
+                [0.95, 0.95, 1.0, 0.9] if is_forward else [0.55, 0.60, 0.72, 0.55],
+                "fwd" if is_forward else "",
+            )
+
+        # 2. the trained band, as a fixed number of samples spread across it (spacing varies with
+        #    the band width; the COUNT never does -- see the id-budget note above).
+        for i in range(self._COMPASS_N_ARC):
+            mid = self._COMPASS_ARC_ID0 + i
+            if not have_nominal:
+                marker(mid, base_pos, 0.001, [0, 0, 0, 0])  # hidden, but still overwritten
+                continue
+            frac = i / (self._COMPASS_N_ARC - 1)  # 0 -> 1 across the band
+            bearing = nominal_deg - max_deg + frac * (2.0 * max_deg)
+            marker(mid, self._compass_ring_pos(base_pos, heading_rot, bearing, radius),
+                   0.028, [1.0, 0.65, 0.10, 0.85])
+
+        # 3. nominal bearing, and 4. the live aim -- both labelled with their numeric value
+        if have_nominal:
+            marker(self._COMPASS_NOMINAL_ID,
+                   self._compass_ring_pos(base_pos, heading_rot, nominal_deg, radius),
+                   0.055, [0.15, 1.0, 0.35, 1.0], f"skill{sid} nom{nominal_deg:+.0f} +-{max_deg:.0f}")
+            marker(self._COMPASS_AIM_ID,
+                   self._compass_ring_pos(base_pos, heading_rot, nominal_deg + aim_deg, radius * 1.06),
+                   0.05, [1.0, 0.25, 0.8, 1.0], f"aim{aim_deg:+.1f}")
+            rad = np.radians(nominal_deg + aim_deg)
+            visualizer.draw_arrow(
+                base_pos, env_data["base_quat"],
+                [radius * np.cos(rad), radius * np.sin(rad), 0.0],
+                color=[1.0, 0.25, 0.8, 1.0], scale=1.0, horizontal_only=True,
+                id=self._COMPASS_ARROW_ID,
+            )
+        else:
+            marker(self._COMPASS_NOMINAL_ID, base_pos, 0.001, [0, 0, 0, 0])
+            marker(self._COMPASS_AIM_ID, base_pos, 0.001, [0, 0, 0, 0])
+            visualizer.draw_arrow(base_pos, env_data["base_quat"], [0.0, 0.0, 0.0],
+                                  color=[0, 0, 0, 0], scale=1.0, horizontal_only=True,
+                                  id=self._COMPASS_ARROW_ID)
+
     def post_step_callback(self, commands: list[str] | None = None):
         for command in commands or []:
             if command == "[TRIGGER_KICK]":
@@ -1412,6 +1578,50 @@ class UnifiedLocoKickPolicy(Policy):
             x, y = self._skill_target_xy[skill_id]
             return float(x), float(y)
         return None
+
+    def get_aim_state(self) -> dict | None:
+        """Everything needed to render the kick aim for the CURRENTLY SELECTED skill, or None if
+        this checkpoint has no per-skill ball/target metadata to derive a nominal bearing from.
+
+        All angles are degrees in the ROBOT's own frame: 0 = straight forward, positive = the
+        robot's left (the convention kick_aim_theta itself uses -- see this module's docstring).
+
+          skill_id     : the pending skill ([CYCLE_KICK_SKILL]'s cursor)
+          nominal_deg  : that skill's trained shot bearing, ball -> target
+          max_deg      : half-width of its trained kick_aim_theta band (per-skill, falling back to
+                         the global kick_aim_theta_ref_deg when the skill lacks the metadata)
+          aim_deg      : the operator's current kick_aim_theta (','/'.'/'0'); always 0 unless
+                         manual_kick_aim_enabled
+          heading_deg  : nominal_deg + aim_deg, i.e. where the kick would actually go
+
+        Single source of truth for both the in-viewer ground ring (_draw_aim_compass) and the
+        separate tkinter compass window (utils/aim_compass_gui.py), so the two can't disagree."""
+        sid = self._selected_skill_id
+        ball = self.get_skill_ball_xy(sid)
+        target = self.get_skill_target_xy(sid)
+        if ball is None or target is None:
+            return None
+        nominal_deg = float(np.degrees(np.arctan2(target[1] - ball[1], target[0] - ball[0])))
+        max_deg = self._skill_kick_aim_max_deg[sid] if 0 <= sid < len(self._skill_kick_aim_max_deg) else None
+        max_deg = float(self._kick_aim_theta_ref_deg if max_deg is None else max_deg)
+        aim_deg = float(self._manual_kick_aim_theta_deg)
+        return {
+            "skill_id": sid,
+            "nominal_deg": nominal_deg,
+            "max_deg": max_deg,
+            "aim_deg": aim_deg,
+            "heading_deg": nominal_deg + aim_deg,
+            "manual_enabled": bool(self._manual_kick_aim_enabled),
+        }
+
+    @property
+    def pending_skill_id(self) -> int:
+        """The skill [TRIGGER_KICK] would fire right now -- i.e. self._selected_skill_id, the
+        cursor [CYCLE_KICK_SKILL] advances (see this module's own docstring). Exposed read-only for
+        external callers that want "whichever skill the operator currently has dialed in" at an
+        arbitrary moment, as opposed to kick_skill_id, which is only meaningful while a kick is
+        actually in flight."""
+        return self._selected_skill_id
 
     def _request_kick(self, skill_id: int = 0):
         """Entry point for [TRIGGER_KICK]/[TRIGGER_KICK:N] -- routes to an immediate _trigger_kick
