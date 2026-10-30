@@ -328,6 +328,9 @@ def main():
 
     dt, n, n_stale, drops, t_wall0 = 1.0 / cfg.policy.freq, 0, 0, 0, time.perf_counter()
     rec = dict(t=[], pelvis_age=[], mode=[], tts=[], ok=[])
+    from collections import deque
+
+    seen = deque(maxlen=a.stale_steps + 3)  # per step: perception messages so far, with the pelvis so far (the watchdog's diagnosis)
     stop_reason = None
     n_reported = 0
     t_next = time.perf_counter()
@@ -350,8 +353,16 @@ def main():
                 tgt_env = pipeline.policy.actions_adapter.fit(target, template=env.dof_cfg.default_pos)
                 if not monitor.check(tgt_env, q, dq):
                     stop_reason = "NaN in the joint targets"
+            seen.append((policy.rt.n_msgs, policy.rt.n_pelvis_msgs))
             if n_stale > a.stale_steps and n > 50:
-                stop_reason = f"no fresh pelvis pose for {n_stale} steps ({n_stale * dt * 1000:.0f} ms)"
+                d_msgs, d_pel = seen[-1][0] - seen[0][0], seen[-1][1] - seen[0][1]
+                age = info.get("pelvis_age", np.inf)
+                why = ("NO messages from perception in that time: perception or the relay stopped or stalled (CPU load? a crash?)"
+                       if d_msgs == 0 else f"{d_msgs} perception messages, none with the pelvis: Motive lost the pelvis rigid body "
+                       "(markers hidden?)" if d_pel == 0 else f"{d_pel} pelvis poses arrived, but older than "
+                       f"{cfg.policy.pelvis_stale_s * 1000:.0f} ms (the last {age * 1000:.0f} ms): a delay between Motive and here "
+                       "(the relay or perception falling behind: CPU load?)")
+                stop_reason = f"no fresh pelvis pose for {n_stale} steps ({n_stale * dt * 1000:.0f} ms) - {why}"
             pz = float(info["pelvis"][2]) if "pelvis" in info else None
             if (pz is not None and pz < 0.45) or (sim and env.fallen):
                 stop_reason = f"pelvis too low ({pz if pz is not None else float(env.data.qpos[2]):.2f} m): fallen"
