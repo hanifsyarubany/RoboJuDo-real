@@ -353,13 +353,14 @@ def main():
                 tgt_env = pipeline.policy.actions_adapter.fit(target, template=env.dof_cfg.default_pos)
                 if not monitor.check(tgt_env, q, dq):
                     stop_reason = "NaN in the joint targets"
-            seen.append((policy.rt.n_msgs, policy.rt.n_pelvis_msgs))
+            seen.append((getattr(policy.rt, "n_msgs", getattr(policy.rt, "n_frames", 0)), getattr(policy.rt, "n_pelvis_msgs", -1)))
             if n_stale > a.stale_steps and n > 50:
                 d_msgs, d_pel = seen[-1][0] - seen[0][0], seen[-1][1] - seen[0][1]
                 age = info.get("pelvis_age", np.inf)
                 why = ("NO messages from perception in that time: perception or the relay stopped or stalled (CPU load? a crash?)"
                        if d_msgs == 0 else f"{d_msgs} perception messages, none with the pelvis: Motive lost the pelvis rigid body "
-                       "(markers hidden?)" if d_pel == 0 else f"{d_pel} pelvis poses arrived, but older than "
+                       "(markers hidden?)" if d_pel == 0 else "(perception's runtime is older: no count of pelvis messages)" if seen[-1][1] < 0
+                       else f"{d_pel} pelvis poses arrived, but older than "
                        f"{cfg.policy.pelvis_stale_s * 1000:.0f} ms (the last {age * 1000:.0f} ms): a delay between Motive and here "
                        "(the relay or perception falling behind: CPU load?)")
                 stop_reason = f"no fresh pelvis pose for {n_stale} steps ({n_stale * dt * 1000:.0f} ms) - {why}"
@@ -405,6 +406,11 @@ def main():
         logger.warning("interrupted")
         if not sim and not a.dry_run:
             hold_guard(pipeline, env, dt, "Ctrl-C")
+    except Exception as e:  # a bug in the loop with torque on: the guard stop, as for any stop (then the error is shown)
+        if not sim and not a.dry_run:
+            logger.exception("error in the control loop")
+            hold_guard(pipeline, env, dt, f"error: {e!r}")
+        raise
     finally:
         wall = time.perf_counter() - t_wall0
         logger.info(f"{n} control steps in {wall:.1f} s wall ({n * dt:.1f} s of control); late steps {drops}")
