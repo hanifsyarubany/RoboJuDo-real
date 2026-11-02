@@ -180,6 +180,15 @@ It splits each shot into the ball model (predicted vs seen ball at the strike), 
 `-c g1_pingpong --log sim.json` (8 balls, all returned: ball model 5 mm, racket 27 mm ~40 ms after the commanded strike, ball 42 mm from
 the face centre, 8/8 within the blade). The racket comes from the joints, not a tracked paddle. Motive at 120 Hz (the lab, 2026-11-02)
 gives the estimator half the samples of the simulations (240 Hz): `--sensing optitrack120` simulates it.
+**Ball noise (2026-11-02).** The lab's stickered ball scatters ~6 mm per axis after the sphere fit (first shot log), not ~1.4 mm as
+simulated; with the estimator told 1 mm it reads the scatter as spin and its first plans miss by 23-31 cm. `g1_pingpong_real` now tells
+it 7 mm (`PingPongPolicyCfg(noise=0.007)`; `--ball-noise-mm` overrides): in simulation with the lab's noise (`--sensing lab`: 120 Hz,
+5.5 mm per sticker marker) first plans 235 -> 34 mm off, returned 89 % -> 94-97 % (64 balls). Perception's `--noise` can stay 1 mm.
+**Capture times (2026-11-02).** Times used to be the arrival minus the sender's age, which carried the arrival's jitter (120 Hz frames
+logged 6.6-8.3 ms apart, some 0.6 ms). Both receivers (perception from the relay, the player from perception) now take the sender's own
+times - Motive's frame times, perception's capture times - plus the median offset to their clock (`pingpong/deploy/mocap.py` ClockMap):
+the frames are back on the exact grid, the mean latency is unchanged. Perception's status and the player's 5 s line show `arrival jitter
+removed p95 x ms` (how much was taken out). A relay without Motive's timestamps falls back to arrival minus age.
 
 ## Watchdogs and stops
 

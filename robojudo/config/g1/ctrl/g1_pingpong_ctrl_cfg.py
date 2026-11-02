@@ -24,7 +24,8 @@ class PingPongSimWorldCtrlCfg(CtrlCfg):
     n_shots: int = 0  # 0: no end (stop with Ctrl-C or by closing the window)
     settle: float = 2.0  # s from the start of play to the first serve
     wait: float = 0.6  # s between a shot's end and the next serve (plus 0.6)
-    sensing: str = "optitrack"  # optitrack (240 Hz) | optitrack120 (the lab's Motive stream, 2026-11-02) | camera | stereo
+    sensing: str = "optitrack"  # optitrack (240 Hz) | optitrack120 (the lab's Motive stream, 2026-11-02) | lab (120 Hz + 5.5 mm per sticker marker = the
+    # ~6 mm per axis ball centres measured in the lab, 2026-11-02) | camera | stereo
     opti_frame: str = "random"  # random: OptiTrack's frame is a random rotation + translation of the table frame; fixed: the same
     clutter: int = 2
     ball_stickers: int = 6  # the ball's dot stickers (as on the lab ball: OptiTrack sees 2-5 of them); 0: a ball covered in reflective

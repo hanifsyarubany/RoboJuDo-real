@@ -50,7 +50,9 @@ class g1_pingpong_real(RlPipelineCfg):
         PingPongPerceptionCtrlCfg(),
         UnitreeCtrlCfg(triggers={"A": "[SHUTDOWN]", "Select": "[SOFT_STOP]", "Start": "[GUARD_STOP]"}),
     ]
-    policy: PingPongPolicyCfg = PingPongPolicyCfg(threaded=True)
+    # noise: the lab's stickered ball scatters ~6 mm per axis (shot log 2026-11-02); with the 1 mm default the estimator takes the scatter
+    # for spin (first plans 235-309 mm off); 7 mm: ~35 mm, sim with lab-like noise 89 % -> 94-97 % returned
+    policy: PingPongPolicyCfg = PingPongPolicyCfg(threaded=True, noise=0.007)
     do_safety_check: bool = False  # the launcher watches the pelvis height and tilt (scripts/run_pingpong.py)
 
 

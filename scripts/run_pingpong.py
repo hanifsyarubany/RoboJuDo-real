@@ -272,9 +272,11 @@ def main():
     ap.add_argument("--env-idx", type=int, default=None)
     ap.add_argument("--n-shots", type=int, default=None, help="sim: stop after this many balls (default: no end; Ctrl-C or close the window)")
     ap.add_argument("--random", type=str, default=None, help="sim: fresh balls of this kind (standard, topspin, short, ...) instead of a scenario file")
-    ap.add_argument("--sensing", choices=["optitrack", "optitrack120", "camera", "stereo"], default=None)
+    ap.add_argument("--sensing", choices=["optitrack", "optitrack120", "lab", "camera", "stereo"], default=None)
     ap.add_argument("--opti-frame", choices=["random", "fixed"], default=None)
     ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--ball-noise-mm", type=float, default=None, help="the estimator's ball position noise, mm per axis (its fit "
+                    "weights, spin prior and gate; the config's value otherwise)")
     ap.add_argument("--fake-pivot", type=float, nargs=3, default=None, metavar=("X", "Y", "Z"),
                     help="sim: the simulated pelvis rigid body's pivot off the pelvis origin (the pelvis origin seen from it, pelvis axes, m)")
     ap.add_argument("--compute-scale", type=float, default=None, help="x the measured planner time (0 = instant)")
@@ -301,6 +303,8 @@ def main():
                 c.send_to = a.raw_to
         if c.ctrl_type == "PingPongPerceptionCtrl" and a.perception_port:
             c.port = a.perception_port
+    if a.ball_noise_mm is not None:
+        cfg.policy.noise = a.ball_noise_mm / 1000.0
     if a.compute_scale is not None:
         cfg.policy.compute_scale = a.compute_scale
     if a.checkpoint:
@@ -421,7 +425,11 @@ def main():
                 ag = np.array([x for x in rec["pelvis_age"][-250:] if np.isfinite(x)]) * 1000
                 if len(ag):
                     logger.info(f"[player] pelvis pose age (camera -> this control step) p50 {np.median(ag):.0f} / p95 "
-                                f"{np.percentile(ag, 95):.0f} / max {ag.max():.0f} ms; stale above {cfg.policy.pelvis_stale_s * 1000:.0f} ms")
+                                f"{np.percentile(ag, 95):.0f} / max {ag.max():.0f} ms; stale above {cfg.policy.pelvis_stale_s * 1000:.0f} ms"
+                                + (f"; arrival jitter removed p95 {np.percentile(perc.rx.jitter, 95) * 1000:.1f} ms"
+                                   if perc is not None and getattr(perc.rx, "jitter", None) else ""))
+                    if perc is not None and getattr(perc.rx, "jitter", None):
+                        perc.rx.jitter.clear()
                 logger.info("[player] " + height.summary(last=50))
             q, dq = env.dof_pos, env.dof_vel
             target = policy._hold if hasattr(policy, "_hold") else None

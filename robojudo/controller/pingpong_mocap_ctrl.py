@@ -28,7 +28,7 @@ from robojudo.controller import Controller, ctrl_registry
 from robojudo.utils.pingpong_path import ensure_pingpong
 
 logger = logging.getLogger(__name__)
-SENSING = {"optitrack": (240.0, 0.001, 0.010), "optitrack120": (120.0, 0.001, 0.010), "camera": (100.0, 0.005, 0.030), "stereo": (60.0, 0.010, 0.030)}
+SENSING = {"optitrack": (240.0, 0.001, 0.010), "optitrack120": (120.0, 0.001, 0.010), "lab": (120.0, 0.001, 0.010, 0.0055), "camera": (100.0, 0.005, 0.030), "stereo": (60.0, 0.010, 0.030)}
 
 
 def world_time(env):
@@ -108,7 +108,7 @@ class PingPongSimWorldCtrl(Controller):
 
         c = cfg_ctrl
         rng = np.random.default_rng(c.seed)
-        hz, noise, latency = SENSING[c.sensing]
+        hz, noise, latency, *ball_noise = SENSING[c.sensing]  # (a 4th value: the ball's markers' own noise)
         if c.opti_frame == "random":
             yaw, origin = rng.uniform(-math.pi, math.pi), np.array([rng.uniform(-3, 3), rng.uniform(-3, 3), 0.0])
         else:
@@ -117,7 +117,7 @@ class PingPongSimWorldCtrl(Controller):
         R = np.array([[co, -s, 0], [s, co, 0], [0, 0, 1.0]])
         self.emu = MocapEmulator(origin, R, hz=hz, noise=noise, latency=latency, pelvis_noise=c.pelvis_noise, clutter=c.clutter,
                                  rng=np.random.default_rng(c.seed + 552_113), ball_stickers=c.ball_stickers,
-                                 pelvis_pivot=c.pelvis_pivot)
+                                 pelvis_pivot=c.pelvis_pivot, ball_noise=ball_noise[0] if ball_noise else None)
         nl, nr, fl = self.emu.table_markers()
         self.frame = TableFrame.from_markers(nl, nr, fl, near_edge_x=config.table()["table"]["near_edge_x"])  # for in-process runs only
         T = config.table()["table"]
