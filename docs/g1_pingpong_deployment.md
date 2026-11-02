@@ -145,6 +145,20 @@ guard pose.
 
 **B7. On the floor** (rope slack, attached): stand 1-2 min; measure the motor delay (command to motion; fix6-7 trained with 0-20 ms).
 
+**B7a. Pelvis pivot (do it at the first floor stand).** Motive's pivot of the pelvis rigid body is where Motive put it (the markers'
+centre unless moved), not the pelvis origin the policy was trained with; every target the policy sees is measured from the pelvis, so
+an offset shifts them all. In simulation a pivot 10 cm low cut the returns from 100 % to 42 % (64 balls; corrected: 98 %). The player
+checks it: while the robot stands on flat feet, the legs (joint angles + IMU, `pingpong/deploy/pelvis_height.py`) give the true pelvis
+height, and every 5 s and at the end it logs
+```
+[player] pelvis height (feet flat, ...): legs 0.761 m, perception 0.668 m ... -> perception reads the pelvis 9.3 cm LOW: ...;
+perception: --pelvis-pivot 0 0 +0.093 (added to its pivot z now, if one is set)
+```
+Restart perception with that value (`run --calibrate-first --pelvis-pivot 0 0 0.093`); it is saved in table_frame.json and kept by
+later calibrations (`0 0 0` clears it). The next run should log `agree (within 5 mm)`. Only valid with the robot's weight on its feet
+(hanging in the gantry with level feet looks the same to the legs); the sim's ready stance is 0.76 m. Redo it whenever the pelvis rigid
+body is edited in Motive. Only the vertical part is measured; x / y stay Motive's.
+
 **B8. Balls:** slow, well-placed serves from a launcher first; fit the ball and rubber models (`ball.yaml`) to real flights before judging.
 
 ## Watchdogs and stops
@@ -188,4 +202,5 @@ planned (`shots while busy`).
 | the two programs in simulation (A2) | 8/8 and 7/8 on two ball sequences, the same as the one-process run; perception calibrated exactly; either start order; 0 lockstep timeouts |
 | perception against `fake_relay.py` (real-time timestamps) | calibrates the relay's frame, 240 frames/s, shots detected |
 | `natnet_relay.py` against a fake Motive (pingpong `tests/deploy/test_natnet_relay.py`) | NatNet 4.1 packets as the lab client parses them, y-up: pelvis pose, the table's 8 markers (occluded left out), unlabeled markers, latency 4.5 ms from the camera timestamps; the chain fake Motive -> relay -> perception calibrates the table exactly and detects the stickered ball's serves |
+| pelvis pivot (`tests/deploy/test_pelvis_pivot.py`, dual sim) | legs' FK = MuJoCo's to 0.0000 mm (100 random poses); `--pelvis-pivot` reads the truth within 0.06 mm at any heading / tilt / rigid body axes; dual sim with a 10 cm fake pivot (`--fake-pivot 0 0 0.10`): the player measured +0.100, returns 100 % / 42.2 % / 98.4 % (no pivot / uncorrected / corrected, 64 balls each) |
 | **not tested** | anything with a real Motive or on the G1: the relay on a real stream, `UnitreeCppEnv` with this policy, `prepare()` to the ready pose, the remote's stops, motor delay, the real ball model, the watchdogs against a real fault |

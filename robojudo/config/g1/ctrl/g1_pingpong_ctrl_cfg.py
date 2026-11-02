@@ -30,6 +30,8 @@ class PingPongSimWorldCtrlCfg(CtrlCfg):
     ball_stickers: int = 6  # the ball's dot stickers (as on the lab ball: OptiTrack sees 2-5 of them); 0: a ball covered in reflective
     # material (one marker at its centre). Perception's --ball must say the same (stickers / covered)
     pelvis_noise: float = 0.0005
+    pelvis_pivot: tuple[float, float, float] = (0.0, 0.0, 0.0)  # a Motive pivot off the pelvis origin (the pelvis origin seen from it, pelvis
+    # axes; a test of the legs' height check and of run_perception.py --pelvis-pivot, which undoes it)
     table_markers: bool = True  # markers on the table's corners (for perception's calibration)
     table_rigid_body: bool = True  # ... tracked as Motive's "table" rigid body (the recommended real setup): sent apart from the unlabeled
     # markers, never taken for the ball, on during play (perception watches the table). False: plain markers, taken off when play starts

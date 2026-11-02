@@ -25,6 +25,12 @@ itself, so after a stop this program keeps the loop running, holding it, until C
                 --max-tilt-deg; a NaN in the targets
 A stop needs this program running: if it is killed or hangs, the last command stays. Unitree's own stop (power) is the last resort.
 
+Pelvis height check (pingpong/deploy/pelvis_height.py). While the robot stands on flat feet, the legs (joint angles + IMU) tell the pelvis
+origin's true height above the floor; perception's pelvis z should match it. Every 5 s and at the end the player logs both and what is
+left over, which is Motive's pivot of the pelvis rigid body sitting off the pelvis origin: give it to perception as
+`run_perception.py ... --pelvis-pivot 0 0 <Z>` (added to the value set now, if any). Valid only with the robot's weight on its feet:
+hanging in the gantry with level feet looks the same to the legs.
+
 Simulation viewer (--window): the ball orange, the racket target blue (during a swing), the station green, home grey.
 """
 
@@ -54,6 +60,57 @@ from robojudo.config.config_manager import ConfigManager
 from robojudo.pipeline.rl_pipeline import RlPipeline
 
 logger = logging.getLogger("robojudo")
+
+
+class PelvisHeightCheck:
+    """Perception's pelvis z against the legs' (forward kinematics on joint angles + IMU), on steps with both soles flat on one level."""
+
+    EVERY = 5  # control steps between samples (the FK is pure python, ~0.2 ms)
+
+    def __init__(self, env):
+        from pingpong.deploy.pelvis_height import LegFK
+
+        self.env, self.fk, self.n = env, LegFK(), 0
+        self.rows = []  # (legs, perception, cos tilt, truth or nan)
+        self.n_not_flat = 0
+
+    def step(self, info, sim):
+        """Never raises (an error in the control loop is a guard stop on the robot): a failing check logs once and turns itself off."""
+        if self.fk is None:
+            return
+        try:
+            self._step(info, sim)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[player] pelvis height check off: {e!r}")
+            self.fk = None
+
+    def _step(self, info, sim):
+        self.n += 1
+        if self.n % self.EVERY or "pelvis" not in info:
+            return
+        q = self.env.base_quat
+        h, flat = self.fk.pelvis_height(self.env.joint_names, self.env.dof_pos, q)
+        if not flat:
+            self.n_not_flat += 1
+            return
+        x, y = q[0], q[1]
+        cz = 1.0 - 2.0 * (x * x + y * y)  # the pelvis z axis's vertical component
+        self.rows.append((h, float(info["pelvis"][2]), cz, float(self.env.data.qpos[2]) if sim else np.nan))
+
+    def summary(self, last=None):
+        r = np.array(self.rows[-last:] if last else self.rows)
+        if not len(r):
+            return f"pelvis height: no step with both feet flat yet ({self.n_not_flat} samples with the feet not level)"
+        legs, perc, cz = np.median(r[:, 0]), np.median(r[:, 1]), np.median(r[:, 2])
+        d = (legs - perc) / max(cz, 0.5)
+        msg = (f"pelvis height (feet flat, {len(r)} samples): legs {legs:.3f} m, perception {perc:.3f} m (spread "
+               f"{np.std(r[:, 1] - r[:, 0]) * 1000:.1f} mm)")
+        if np.isfinite(r[:, 3]).all():
+            msg += f", truth {np.median(r[:, 3]):.3f} m"
+        if abs(d) < 0.005:
+            return msg + " -> agree (within 5 mm)"
+        return (msg + f" -> perception reads the pelvis {abs(d) * 100:.1f} cm {'LOW' if d > 0 else 'HIGH'}: Motive's pivot is off the pelvis "
+                f"origin; perception: --pelvis-pivot 0 0 {d:+.3f} (added to its pivot z now, if one is set). Valid only standing on the feet")
 
 
 class ActionMonitor:
@@ -217,6 +274,8 @@ def main():
     ap.add_argument("--sensing", choices=["optitrack", "camera", "stereo"], default=None)
     ap.add_argument("--opti-frame", choices=["random", "fixed"], default=None)
     ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--fake-pivot", type=float, nargs=3, default=None, metavar=("X", "Y", "Z"),
+                    help="sim: the simulated pelvis rigid body's pivot off the pelvis origin (the pelvis origin seen from it, pelvis axes, m)")
     ap.add_argument("--compute-scale", type=float, default=None, help="x the measured planner time (0 = instant)")
     ap.add_argument("--checkpoint", type=str, default=None)
     ap.add_argument("--actor-path", type=str, default=None)
@@ -233,6 +292,8 @@ def main():
             for k in ("balls", "env_idx", "n_shots", "random", "sensing", "opti_frame", "seed"):
                 if getattr(a, k, None) is not None:
                     setattr(c, k, getattr(a, k))
+            if a.fake_pivot is not None:
+                c.pelvis_pivot = tuple(a.fake_pivot)
             if a.raw_to and c.send_to:
                 c.send_to = a.raw_to
         if c.ctrl_type == "PingPongPerceptionCtrl" and a.perception_port:
@@ -323,6 +384,7 @@ def main():
 
         env.viz_fn = viz
     monitor = ActionMonitor(env, policy)
+    height = PelvisHeightCheck(env)
     timer = StageTimer()
     timer.wrap(pipeline.policy, "get_observation", "policy.get_observation (planner jobs)")
     timer.wrap(pipeline.policy, "get_pd_target", "policy.get_pd_target (actor)")
@@ -349,6 +411,7 @@ def main():
             rec["mode"].append(info.get("mode", -1))
             rec["tts"].append(info.get("time_to_strike", np.nan))
             rec["ok"].append(bool(info.get("ok", False)))
+            height.step(info, sim and not a.dry_run)
             # ---- watchdogs
             n_stale = n_stale + 1 if (not info.get("ok", False) or info.get("pelvis_age", np.inf) > cfg.policy.pelvis_stale_s) else 0
             if not sim and n % 250 == 0:  # the robot: how old perception's pelvis pose is here, every 5 s
@@ -356,6 +419,7 @@ def main():
                 if len(ag):
                     logger.info(f"[player] pelvis pose age (camera -> this control step) p50 {np.median(ag):.0f} / p95 "
                                 f"{np.percentile(ag, 95):.0f} / max {ag.max():.0f} ms; stale above {cfg.policy.pelvis_stale_s * 1000:.0f} ms")
+                logger.info("[player] " + height.summary(last=50))
             q, dq = env.dof_pos, env.dof_vel
             target = policy._hold if hasattr(policy, "_hold") else None
             if target is not None:
@@ -425,6 +489,7 @@ def main():
         logger.info(f"{n} control steps in {wall:.1f} s wall ({n * dt:.1f} s of control); late steps {drops}")
         timer.report(dt * 1000.0)
         monitor.report()
+        logger.info("[player] " + height.summary())
         if sim:
             R = env.results
             ret = sum(r["returned"] for r in R)

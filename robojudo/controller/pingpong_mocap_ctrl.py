@@ -116,7 +116,8 @@ class PingPongSimWorldCtrl(Controller):
         s, co = math.sin(yaw), math.cos(yaw)
         R = np.array([[co, -s, 0], [s, co, 0], [0, 0, 1.0]])
         self.emu = MocapEmulator(origin, R, hz=hz, noise=noise, latency=latency, pelvis_noise=c.pelvis_noise, clutter=c.clutter,
-                                 rng=np.random.default_rng(c.seed + 552_113), ball_stickers=c.ball_stickers)
+                                 rng=np.random.default_rng(c.seed + 552_113), ball_stickers=c.ball_stickers,
+                                 pelvis_pivot=c.pelvis_pivot)
         nl, nr, fl = self.emu.table_markers()
         self.frame = TableFrame.from_markers(nl, nr, fl, near_edge_x=config.table()["table"]["near_edge_x"])  # for in-process runs only
         T = config.table()["table"]
