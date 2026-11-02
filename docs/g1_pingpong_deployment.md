@@ -100,6 +100,13 @@ python scripts/deploy/run_perception.py run              # status every 2 s: car
 robot faced, so calibration measures the pelvis rigid body's heading and corrects it to 0 (`pelvis: the rigid body's x axis was at
 +37.0 deg ...`; saved in table_frame.json; a placement error stays as a heading error: use a line on the floor). A rigid body whose
 up axis is more than 20 deg from vertical is refused (fix it in Motive). `--keep-pelvis-axes` takes Motive's axes as they are.
+**The heading is measured once and kept** (since 2026-11-02): later calibrations redo the table only and print `heading correction
+... kept from the previous calibration`, so a robot hanging a few degrees turned that day does not become a heading error.
+`--recalibrate-pelvis` measures it again (robot standing still, facing the table squarely). **Live, while the player runs:** type
+`h` + Enter in perception's terminal once the robot STANDS at home facing the table squarely, BEFORE THE FIRST BALL: it measures for
+2 s while perception keeps sending, turns the correction in over 1 s and saves it (refused above 15 deg or if the robot moves). After
+balls `h` is refused (`h!` forces it): the robot turns during play (in simulation ~13 deg after a few balls, as on the robot), and
+measuring then makes that turn its "facing the table" - in simulation that cost 98 % -> 62 % returned. A ball on: refused.
 With a table rigid body the status line ends in `table steady (0.1 mm)`; `table MOVED 12 mm: STOP and recalibrate` means it was bumped.
 The ball (`--ball`, `pingpong/deploy/ball_markers.py`): `stickers` (the default) groups the markers within one ball diameter into one
 ball and fits the sphere of the ball's radius through them, which finds the centre; the markers' mean would sit ~6 mm toward the
@@ -160,6 +167,19 @@ later calibrations (`0 0 0` clears it). The next run should log `agree (within 5
 body is edited in Motive. Only the vertical part is measured; x / y stay Motive's.
 
 **B8. Balls:** slow, well-placed serves from a launcher first; fit the ball and rubber models (`ball.yaml`) to real flights before judging.
+
+**B9. Recording a session (where do the misses come from?).** Run the player with `--log <file>.json`: the runtime's shot recorder
+keeps, per ball, the samples perception sent, every plan applied (the predicted ball at the strike, the racket target) and, every
+control step, the paddle face from the joint angles. Then, on any computer with the pingpong folder:
+```bash
+python scripts/run_pingpong.py -c g1_pingpong_real --log ~/shots_$(date +%H%M).json      # robot; the file is written when the program ends
+python scripts/deploy/analyze_shots.py shots_1430.json --shots                             # pingpong folder
+```
+It splits each shot into the ball model (predicted vs seen ball at the strike), timing (swing vs ball at the hitting plane), the racket
+(closest approach of the face to its target) and the ball's closest approach to the face. Compare with simulation, same command with
+`-c g1_pingpong --log sim.json` (8 balls, all returned: ball model 5 mm, racket 27 mm ~40 ms after the commanded strike, ball 42 mm from
+the face centre, 8/8 within the blade). The racket comes from the joints, not a tracked paddle. Motive at 120 Hz (the lab, 2026-11-02)
+gives the estimator half the samples of the simulations (240 Hz): `--sensing optitrack120` simulates it.
 
 ## Watchdogs and stops
 

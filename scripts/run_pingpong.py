@@ -262,7 +262,8 @@ def main():
     ap.add_argument("--max-seconds", type=float, default=0.0, help="stop after this long (sim time in sim); 0: no limit")
     ap.add_argument("--window", action="store_true", help="sim: open the MuJoCo viewer")
     ap.add_argument("--realtime", action="store_true", help="sim: pace to real time (default: as fast as possible)")
-    ap.add_argument("--log", type=str, default=None, help="write the run's per-step record and shot results here (.npz / .json)")
+    ap.add_argument("--log", type=str, default=None, help="write the run's record here: .json = every shot's ball samples, plans and "
+                    "paddle face per step (the shot recorder; pingpong scripts/deploy/analyze_shots.py reads it); .npz = per-step timing")
     ap.add_argument("--wait-perception", type=float, default=300.0, help="s to wait for the perception program before giving up")
     ap.add_argument("--perception-port", type=int, default=None, help="UDP port perception's messages come to (7780)")
     ap.add_argument("--raw-to", type=str, default=None, help="sim: host:port the simulated cameras send raw frames to (127.0.0.1:7770)")
@@ -271,7 +272,7 @@ def main():
     ap.add_argument("--env-idx", type=int, default=None)
     ap.add_argument("--n-shots", type=int, default=None, help="sim: stop after this many balls (default: no end; Ctrl-C or close the window)")
     ap.add_argument("--random", type=str, default=None, help="sim: fresh balls of this kind (standard, topspin, short, ...) instead of a scenario file")
-    ap.add_argument("--sensing", choices=["optitrack", "camera", "stereo"], default=None)
+    ap.add_argument("--sensing", choices=["optitrack", "optitrack120", "camera", "stereo"], default=None)
     ap.add_argument("--opti-frame", choices=["random", "fixed"], default=None)
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--fake-pivot", type=float, nargs=3, default=None, metavar=("X", "Y", "Z"),
@@ -284,6 +285,8 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     cfg = ConfigManager(config_name=a.config).get_cfg()
+    if a.log and a.log.endswith(".json"):
+        cfg.policy.record_shots = True
     if a.pelvis_stale_ms is not None:
         cfg.policy.pelvis_stale_s = a.pelvis_stale_ms / 1000.0
     sim = bool(cfg.env.is_sim)
@@ -504,7 +507,9 @@ def main():
                   f"shots while busy {rt.n_busy}; dry-run style torque excess steps (joints): {int((monitor.torque_over > 0).sum())}")
         if a.log:
             if a.log.endswith(".json"):
-                json.dump(dict(results=env.results if sim else [], shots=policy.rt.shots), open(a.log, "w"), indent=1, default=float)
+                meta = dict(config=a.config, sim=sim, dry_run=a.dry_run, checkpoint=str(cfg.policy.checkpoint), cam_hz=cfg.policy.cam_hz,
+                            date=time.strftime("%Y-%m-%d %H:%M:%S"), stop=stop_reason, n_busy=policy.rt.n_busy)
+                json.dump(dict(meta=meta, results=env.results if sim else [], shots=policy.rt.shots), open(a.log, "w"), default=float)
             else:
                 np.savez(a.log, **{k: np.array(v) for k, v in rec.items()})
             print(f"-> {a.log}")

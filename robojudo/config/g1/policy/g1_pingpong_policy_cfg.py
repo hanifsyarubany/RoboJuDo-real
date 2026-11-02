@@ -64,3 +64,4 @@ class PingPongPolicyCfg(PolicyCfg):
     pelvis_stale_s: float = 0.05  # a pelvis pose older than this counts as lost (the launcher stops the robot after a while)
     ball: str = "stickers"  # perception inside the player (g1_pingpong_inproc only): stickers | covered, as the sim world's ball_stickers
     seed: int = 0
+    record_shots: bool = False  # the runtime's shot recorder: ball samples, plans, paddle face per step (run_pingpong.py --log x.json)

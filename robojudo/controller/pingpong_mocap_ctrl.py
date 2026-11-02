@@ -28,7 +28,7 @@ from robojudo.controller import Controller, ctrl_registry
 from robojudo.utils.pingpong_path import ensure_pingpong
 
 logger = logging.getLogger(__name__)
-SENSING = {"optitrack": (240.0, 0.001, 0.010), "camera": (100.0, 0.005, 0.030), "stereo": (60.0, 0.010, 0.030)}
+SENSING = {"optitrack": (240.0, 0.001, 0.010), "optitrack120": (120.0, 0.001, 0.010), "camera": (100.0, 0.005, 0.030), "stereo": (60.0, 0.010, 0.030)}
 
 
 def world_time(env):
