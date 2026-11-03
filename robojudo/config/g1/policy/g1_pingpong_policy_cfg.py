@@ -64,4 +64,11 @@ class PingPongPolicyCfg(PolicyCfg):
     pelvis_stale_s: float = 0.05  # a pelvis pose older than this counts as lost (the launcher stops the robot after a while)
     ball: str = "stickers"  # perception inside the player (g1_pingpong_inproc only): stickers | covered, as the sim world's ball_stickers
     seed: int = 0
+    racket_z_offset: float = 0.0  # m added to the racket target's height in the OBSERVATION only (the arm sags below its target on the
+    # robot: 4-6 cm in the 2026-11-02 shot log); the planner and the recorded targets keep the true height
+    script_plans: str | None = None  # shadow swings: a shot log whose plans are replayed to the policy without a ball (run_pingpong.py
+    # --script-plans; pingpong/deploy/script_plans.py)
+    manual_port: int | None = None  # manual planner: swings typed in pingpong scripts/deploy/planner_console.py, UDP to this port
+    # (run_pingpong.py --manual; pingpong/deploy/manual_plans.py)
+    manual_host: str = "127.0.0.1"  # the interface it listens on (0.0.0.0: a console on another computer)
     record_shots: bool = False  # the runtime's shot recorder: ball samples, plans, paddle face per step (run_pingpong.py --log x.json)

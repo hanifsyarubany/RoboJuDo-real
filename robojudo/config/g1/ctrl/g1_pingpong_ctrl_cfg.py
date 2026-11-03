@@ -22,6 +22,7 @@ class PingPongSimWorldCtrlCfg(CtrlCfg):
     env_idx: int = 0  # the scenario's sequence to start with (of 64, 8 balls each)
     random: str | None = None  # instead: fresh balls of this kind, drawn without end (scripts/planner/make_ball_scenarios.py: standard, topspin, ...)
     n_shots: int = 0  # 0: no end (stop with Ctrl-C or by closing the window)
+    serve: bool = True  # False: the opponent serves no ball (shadow swings / manual planner: run_pingpong.py --script-plans / --manual)
     settle: float = 2.0  # s from the start of play to the first serve
     wait: float = 0.6  # s between a shot's end and the next serve (plus 0.6)
     sensing: str = "optitrack"  # optitrack (240 Hz) | optitrack120 (the lab's Motive stream, 2026-11-02) | lab (120 Hz + 5.5 mm per sticker marker = the
@@ -31,6 +32,8 @@ class PingPongSimWorldCtrlCfg(CtrlCfg):
     ball_stickers: int = 6  # the ball's dot stickers (as on the lab ball: OptiTrack sees 2-5 of them); 0: a ball covered in reflective
     # material (one marker at its centre). Perception's --ball must say the same (stickers / covered)
     pelvis_noise: float = 0.0005
+    far_drop: float = 0.0  # each sticker also lost with this probability beyond x 2.2 m (thin camera coverage over the far half;
+    # 0.12 = the lab's 17-29 % of frames without a ball sample there, 2026-11-02)
     pelvis_pivot: tuple[float, float, float] = (0.0, 0.0, 0.0)  # a Motive pivot off the pelvis origin (the pelvis origin seen from it, pelvis
     # axes; a test of the legs' height check and of run_perception.py --pelvis-pivot, which undoes it)
     table_markers: bool = True  # markers on the table's corners (for perception's calibration)

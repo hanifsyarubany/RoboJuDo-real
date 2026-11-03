@@ -117,7 +117,8 @@ class PingPongSimWorldCtrl(Controller):
         R = np.array([[co, -s, 0], [s, co, 0], [0, 0, 1.0]])
         self.emu = MocapEmulator(origin, R, hz=hz, noise=noise, latency=latency, pelvis_noise=c.pelvis_noise, clutter=c.clutter,
                                  rng=np.random.default_rng(c.seed + 552_113), ball_stickers=c.ball_stickers,
-                                 pelvis_pivot=c.pelvis_pivot, ball_noise=ball_noise[0] if ball_noise else None)
+                                 pelvis_pivot=c.pelvis_pivot, ball_noise=ball_noise[0] if ball_noise else None,
+                                 far_drop=c.far_drop)
         nl, nr, fl = self.emu.table_markers()
         self.frame = TableFrame.from_markers(nl, nr, fl, near_edge_x=config.table()["table"]["near_edge_x"])  # for in-process runs only
         T = config.table()["table"]
@@ -222,7 +223,7 @@ class PingPongSimWorldCtrl(Controller):
         if self._was_active and not active:  # the last shot resolved: the opponent waits, then serves the next
             self.next_launch = t + c.wait + 0.6
         self._was_active = active
-        if not active and (c.n_shots <= 0 or self.k < c.n_shots) and t >= self.next_launch - 1e-9:
+        if c.serve and not active and (c.n_shots <= 0 or self.k < c.n_shots) and t >= self.next_launch - 1e-9:
             p0, v0, w0 = self._next_ball()
             env.launch_ball(self.k, np.asarray(p0, float), np.asarray(v0, float), np.asarray(w0, float))
             self.emu.add_ball(t, np.asarray(p0, float), np.asarray(w0, float))

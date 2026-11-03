@@ -5,6 +5,7 @@ Dual deployment: two programs, the same in simulation and on the robot (see docs
     1. perception (pingpong folder):  python scripts/deploy/run_perception.py run --calibrate-first
     2. this player (RoboJuDo):        python scripts/run_pingpong.py -c g1_pingpong [--window --realtime]   # simulation: serves without end
                                       python scripts/run_pingpong.py -c g1_pingpong_real [--dry-run]        # the robot
+    the policy alone, you as the planner:  add --manual, and type swings in the pingpong folder's scripts/deploy/planner_console.py
 
 Either may start first. The player waits (--wait-perception s) for perception to report the pelvis before anything moves: in simulation the
 world stands still meanwhile (the robot in its ready pose, no ball) and its cameras run, so that perception can calibrate the table; on
@@ -250,6 +251,25 @@ def hold_guard(pipeline, env, dt, reason):
         logger.warning("ended after the stop")
 
 
+LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs", "pingpong")  # (logs/ is git-ignored)
+
+
+def log_path(name, kind):
+    """--log's file: a name or relative path inside LOG_DIR (created); "" = <kind>_<date>_<time>.json there. An absolute path is kept
+    (with a warning when it is outside this workspace)."""
+    if not name:
+        name = f"{kind}_{time.strftime('%Y%m%d_%H%M%S')}.json"
+    if os.path.isabs(name):
+        ws = os.path.dirname(os.path.dirname(LOG_DIR))
+        if not os.path.abspath(name).startswith(ws + os.sep):
+            logger.warning(f"--log {name} is outside the RoboJuDo workspace (logs go to {LOG_DIR} with a name or relative path)")
+        path = name
+    else:
+        path = os.path.join(LOG_DIR, name)
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    return path
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-c", "--config", default="g1_pingpong")
@@ -262,8 +282,10 @@ def main():
     ap.add_argument("--max-seconds", type=float, default=0.0, help="stop after this long (sim time in sim); 0: no limit")
     ap.add_argument("--window", action="store_true", help="sim: open the MuJoCo viewer")
     ap.add_argument("--realtime", action="store_true", help="sim: pace to real time (default: as fast as possible)")
-    ap.add_argument("--log", type=str, default=None, help="write the run's record here: .json = every shot's ball samples, plans and "
-                    "paddle face per step (the shot recorder; pingpong scripts/deploy/analyze_shots.py reads it); .npz = per-step timing")
+    ap.add_argument("--log", type=str, nargs="?", const="", default=None, help="write the run's record: .json = every shot's ball "
+                    "samples, plans and paddle face per step (the shot recorder; pingpong scripts/deploy/analyze_shots.py reads it); "
+                    ".npz = per-step timing. A name or relative path goes into this workspace's logs/pingpong/; --log alone: "
+                    "logs/pingpong/<shots|shadow|manual>_<date>_<time>.json")
     ap.add_argument("--wait-perception", type=float, default=300.0, help="s to wait for the perception program before giving up")
     ap.add_argument("--perception-port", type=int, default=None, help="UDP port perception's messages come to (7780)")
     ap.add_argument("--raw-to", type=str, default=None, help="sim: host:port the simulated cameras send raw frames to (127.0.0.1:7770)")
@@ -275,16 +297,33 @@ def main():
     ap.add_argument("--sensing", choices=["optitrack", "optitrack120", "lab", "camera", "stereo"], default=None)
     ap.add_argument("--opti-frame", choices=["random", "fixed"], default=None)
     ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--paddle-extra-mass", type=float, default=None, help="sim: kg added to the paddle at the blade centre (a test of "
+                    "the arm's sag with the real, heavier paddle)")
+    ap.add_argument("--racket-z-offset", type=float, default=None, help="m added to the racket target's height in the policy's "
+                    "observation (the arm sags below its target; the planner and the ball keep the true height)")
+    ap.add_argument("--far-drop", type=float, default=None, help="sim: each sticker also lost with this probability beyond x 2.2 m "
+                    "(the lab's thin far-half coverage: 0.12)")
     ap.add_argument("--ball-noise-mm", type=float, default=None, help="the estimator's ball position noise, mm per axis (its fit "
                     "weights, spin prior and gate; the config's value otherwise)")
     ap.add_argument("--fake-pivot", type=float, nargs=3, default=None, metavar=("X", "Y", "Z"),
                     help="sim: the simulated pelvis rigid body's pivot off the pelvis origin (the pelvis origin seen from it, pelvis axes, m)")
+    ap.add_argument("--script-plans", type=str, default=None, help="shadow swings: replay this shot log's plans to the policy without a "
+                    "ball (the policy alone; with --log the recorder gives the racket against the targets). Sim: no serves, ends when done")
+    ap.add_argument("--manual", type=int, nargs="?", const=7790, default=None, metavar="PORT",
+                    help="manual planner: the policy alone, live - you type the swings in pingpong scripts/deploy/planner_console.py "
+                    "(another terminal), UDP to this port (7790); every swing's racket result comes back. Sim: no serves, real time (add --window to watch)")
+    ap.add_argument("--manual-host", type=str, default=None, help="the interface --manual listens on (default 127.0.0.1; 0.0.0.0 for "
+                    "a console on another computer)")
     ap.add_argument("--compute-scale", type=float, default=None, help="x the measured planner time (0 = instant)")
     ap.add_argument("--checkpoint", type=str, default=None)
     ap.add_argument("--actor-path", type=str, default=None)
     ap.add_argument("--start-offset", type=float, nargs=3, default=[0.0, 0.0, 0.0], metavar=("FWD", "LEFT", "YAW_DEG"), help="sim: start off home")
     a = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    if a.log is not None:
+        a.log = log_path(a.log, "manual" if a.manual is not None else "shadow" if a.script_plans else "shots")
+    if a.script_plans and not os.path.isabs(a.script_plans) and not os.path.exists(a.script_plans):
+        a.script_plans = os.path.join(LOG_DIR, a.script_plans)  # a shot log by its name in logs/pingpong/
 
     cfg = ConfigManager(config_name=a.config).get_cfg()
     if a.log and a.log.endswith(".json"):
@@ -297,22 +336,45 @@ def main():
             for k in ("balls", "env_idx", "n_shots", "random", "sensing", "opti_frame", "seed"):
                 if getattr(a, k, None) is not None:
                     setattr(c, k, getattr(a, k))
+            if a.far_drop is not None:
+                c.far_drop = a.far_drop
             if a.fake_pivot is not None:
                 c.pelvis_pivot = tuple(a.fake_pivot)
             if a.raw_to and c.send_to:
                 c.send_to = a.raw_to
         if c.ctrl_type == "PingPongPerceptionCtrl" and a.perception_port:
             c.port = a.perception_port
+    if a.paddle_extra_mass is not None and sim:
+        cfg.env.paddle_extra_mass = a.paddle_extra_mass
+    if a.racket_z_offset is not None:
+        cfg.policy.racket_z_offset = a.racket_z_offset
     if a.ball_noise_mm is not None:
         cfg.policy.noise = a.ball_noise_mm / 1000.0
     if a.compute_scale is not None:
         cfg.policy.compute_scale = a.compute_scale
+    if a.script_plans:
+        cfg.policy.script_plans = a.script_plans
+        for c in cfg.ctrl:
+            if c.ctrl_type == "PingPongSimWorldCtrl":
+                c.serve = False
+    if a.manual is not None:
+        if a.script_plans:
+            ap.error("--manual or --script-plans, not both")
+        cfg.policy.manual_port = a.manual
+        if a.manual_host:
+            cfg.policy.manual_host = a.manual_host
+        for c in cfg.ctrl:
+            if c.ctrl_type == "PingPongSimWorldCtrl":
+                c.serve = False
     if a.checkpoint:
         cfg.policy.checkpoint = a.checkpoint
     if a.actor_path:
         cfg.policy.actor_path = a.actor_path
     if sim:
         cfg.env.headless = not a.window
+        if a.manual is not None and not a.realtime:  # typed swings need the simulation at the speed of the person typing
+            a.realtime = True
+            logger.info("--manual in simulation: paced to real time (--realtime)" + ("" if a.window else "; add --window to watch it"))
     if not sim and not a.dry_run:
         logger.warning("REAL ROBOT, torque will be applied. Gantry rope on? Remote in hand (A / Select / Start = stop: legs limp, arms "
                        "guard pose, held until Ctrl-C)?")
@@ -390,6 +452,9 @@ def main():
             return out
 
         env.viz_fn = viz
+    if a.manual is not None:
+        print(f"\n=== manual planner: in another terminal (pingpong folder)\n    python scripts/deploy/planner_console.py --port {a.manual}"
+              + ("" if cfg.policy.manual_host == "127.0.0.1" else " --host <this computer>") + "\n", flush=True)
     monitor = ActionMonitor(env, policy)
     height = PelvisHeightCheck(env)
     timer = StageTimer()
@@ -406,6 +471,7 @@ def main():
     seen = deque(maxlen=a.stale_steps + 3)  # per step: perception messages so far, with the pelvis so far (the watchdog's diagnosis)
     stop_reason = None
     n_reported = 0
+    script_said = False
     t_next = time.perf_counter()
     try:
         while True:
@@ -461,6 +527,12 @@ def main():
                 if not a.dry_run and not sim:  # the guard is carried out by stepping: hold it until Ctrl-C
                     hold_guard(pipeline, env, dt, stop_reason)
                 break
+            if a.script_plans and policy.rt.script_done and not script_said:
+                script_said = True
+                logger.info(f"[player] shadow swings done: {len(policy.rt.shots)} played, {policy.rt.pipe.n_skipped} plans skipped"
+                            + ("" if sim else " - the robot keeps standing; Ctrl-C to stop (the log is written then)"))
+                if sim:
+                    break
             if sim and sim_ctrl is not None and sim_ctrl.done:
                 for _ in range(25):  # a moment more, so the last ball's outcome is seen through
                     pipeline.step(dry_run=a.dry_run)
@@ -516,7 +588,10 @@ def main():
         if a.log:
             if a.log.endswith(".json"):
                 meta = dict(config=a.config, sim=sim, dry_run=a.dry_run, checkpoint=str(cfg.policy.checkpoint), cam_hz=cfg.policy.cam_hz,
-                            date=time.strftime("%Y-%m-%d %H:%M:%S"), stop=stop_reason, n_busy=policy.rt.n_busy)
+                            date=time.strftime("%Y-%m-%d %H:%M:%S"), stop=stop_reason, n_busy=policy.rt.n_busy,
+                            ball_noise_m=cfg.policy.noise, racket_z_offset_m=cfg.policy.racket_z_offset,
+                            paddle_extra_mass_kg=getattr(cfg.env, "paddle_extra_mass", None) if sim else None,
+                            script_plans=cfg.policy.script_plans, manual_port=cfg.policy.manual_port)
                 json.dump(dict(meta=meta, results=env.results if sim else [], shots=policy.rt.shots), open(a.log, "w"), default=float)
             else:
                 np.savez(a.log, **{k: np.array(v) for k, v in rec.items()})

@@ -52,6 +52,10 @@ class PingPongMujocoEnv(MujocoEnv):
             for g in spec.geoms:
                 if g.name.startswith("table_"):
                     g.contype, g.conaffinity = 1, 1
+        if cfg_env.paddle_extra_mass:  # a heavier paddle than the model's (the real one was never weighed): a point mass at the blade centre
+            for b in spec.bodies:
+                if b.name == "right_paddle_face":
+                    b.mass = b.mass + cfg_env.paddle_extra_mass
         self.model = spec.compile()
         self.model.opt.timestep = self.sim_dt
         if cfg_env.foot_floor_friction is not None:

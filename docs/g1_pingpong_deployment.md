@@ -63,7 +63,7 @@ Nothing changes in the player but `-c g1_pingpong_real`; nothing changes in perc
 
 **B1. Install** on the control PC (an external PC on the robot's Ethernet; the G1's own computer is too slow for the planner): RoboJuDo's
 environment + `numba`, `unitree_sdk2` + `unitree_cpp` (`docs/unitree_setup.md`), the pingpong folder (or `pingpong/`, `configs/`,
-`data/motions/npz/swings_mix.npz`, `data/planner_tables/`, `calibration/`; `PINGPONG_ROOT` if it lives elsewhere). The policy
+`data/motions/npz/swings_mix.npz`, `data/planner_tables/`, `calibration/`; `PINGPONG_ROOT` if it lives elsewhere). Since 2026-11-03 the robot's pingpong files come from GitHub (public): `git clone https://github.com/uaimrobot/humanoid-pingpong-uaim ~/humanoid-pingpong-uaim`, `export PINGPONG_ROOT=~/humanoid-pingpong-uaim`, updates with `git pull` (the robot's own `calibration/table_frame.json` is tracked there: `git stash` before a pull if perception rewrote it). The policy
 itself is in RoboJuDo: `assets/motions/g1/pingpong_play/model_16500.pt` + its `params/` (stage4-fix6-7 @16500, the default for
 simulation and the robot; `--checkpoint` for another). Check:
 `python -c "from robojudo.environment import UnitreeCppEnv"`. Without torch there: `Actor('model_16500.pt').export_npz('actor.npz')` and
@@ -107,6 +107,11 @@ up axis is more than 20 deg from vertical is refused (fix it in Motive). `--keep
 2 s while perception keeps sending, turns the correction in over 1 s and saves it (refused above 15 deg or if the robot moves). After
 balls `h` is refused (`h!` forces it): the robot turns during play (in simulation ~13 deg after a few balls, as on the robot), and
 measuring then makes that turn its "facing the table" - in simulation that cost 98 % -> 62 % returned. A ball on: refused.
+**How exact the heading must be** (2026-11-03, the deployed policy fix6-7 @16500 in Isaac, the same 1905 balls with the heading the
+policy sees off by exactly +-N deg; `eval_closed_loop.py --heading_bias N`): 0 / 2 / 4 / 6 / 8 / 10 deg = 90.1 / 89.4 / 85.9 / 77.1 /
+58.2 / 37.5 % returned. **Keep it within 2 deg** (free); 4 deg costs 4 points, 6 deg 13. The racket lands where a turned robot would
+put it (10 cm and 9 deg off at 10 deg), and no policy can notice: a robustness-trained policy (fix7c, +-6 deg in training) did the
+same at 10 deg and lost 5-8 points everywhere else. A pelvis position 4 cm off costs 2 points (`--pelvis_offset 0.04`).
 With a table rigid body the status line ends in `table steady (0.1 mm)`; `table MOVED 12 mm: STOP and recalibrate` means it was bumped.
 The ball (`--ball`, `pingpong/deploy/ball_markers.py`): `stickers` (the default) groups the markers within one ball diameter into one
 ball and fits the sphere of the ball's radius through them, which finds the centre; the markers' mean would sit ~6 mm toward the
@@ -168,18 +173,37 @@ body is edited in Motive. Only the vertical part is measured; x / y stay Motive'
 
 **B8. Balls:** slow, well-placed serves from a launcher first; fit the ball and rubber models (`ball.yaml`) to real flights before judging.
 
-**B9. Recording a session (where do the misses come from?).** Run the player with `--log <file>.json`: the runtime's shot recorder
+**B9. Recording a session (where do the misses come from?).** Run the player with `--log` (logs go inside this workspace, in `logs/pingpong/` (git-ignored): `--log` alone names the file `<shots|shadow|manual>_<date>_<time>.json`, `--log name.json` or a relative path puts it there too; `--script-plans name.json` also finds a shot log there by name): the runtime's shot recorder
 keeps, per ball, the samples perception sent, every plan applied (the predicted ball at the strike, the racket target) and, every
 control step, the paddle face from the joint angles. Then, on any computer with the pingpong folder:
 ```bash
-python scripts/run_pingpong.py -c g1_pingpong_real --log ~/shots_$(date +%H%M).json      # robot; the file is written when the program ends
-python scripts/deploy/analyze_shots.py shots_1430.json --shots                             # pingpong folder
+python scripts/run_pingpong.py -c g1_pingpong_real --log      # robot -> logs/pingpong/shots_<date>_<time>.json, written when it ends
+python scripts/deploy/analyze_shots.py <RoboJuDo>/logs/pingpong/shots_20261102_1430.json --shots    # pingpong folder
 ```
 It splits each shot into the ball model (predicted vs seen ball at the strike), timing (swing vs ball at the hitting plane), the racket
 (closest approach of the face to its target) and the ball's closest approach to the face. Compare with simulation, same command with
 `-c g1_pingpong --log sim.json` (8 balls, all returned: ball model 5 mm, racket 27 mm ~40 ms after the commanded strike, ball 42 mm from
 the face centre, 8/8 within the blade). The racket comes from the joints, not a tracked paddle. Motive at 120 Hz (the lab, 2026-11-02)
 gives the estimator half the samples of the simulations (240 Hz): `--sensing optitrack120` simulates it.
+**Perception guards (2026-11-02, from the first real shot logs).** Perception now (1) turns a pelvis that Motive solved upside down back
+(a 180 deg turn about one of the rigid body's axes; the status line says `PELVIS UPSIDE DOWN in Motive N frames` - fix the rigid body:
+more markers, asymmetric, clear of the arms), (2) drops ball candidates below the table top over the table (the glossy table's mirror
+image; `table reflections dropped N`), (3) declares "turned" from the last 50 ms (a line fit, 3 cm back from the ball's nearest point)
+instead of the last 3 samples: with 6 mm ball noise the old rule fired on every slow ball rising after the bounce (80/80 in a
+synthetic test, 0/80 now) and stopped its plans; real hits are still detected (80/80, ~7 cm after the hit). "stalled" now also needs the
+samples to sit within 2 cm. The recorder adds `joint_names`, `q`, `q_target` per step and `tilt` / `grav_err` (the pelvis pose against the
+IMU's gravity: ~0 good, 100-180 upside down); analyze_shots prints both (joint target minus angle at the strike; shots with a bad pose).
+`--racket-z-offset M` (player) adds M to the racket target's height in the policy's observation only: in simulation with a +90 g paddle
+it did NOT help (0 cm 98.4 %, +4 cm 92.2 %, +7 cm 78.1 %: the policy follows only ~30-55 % of the shift and the sim arm barely sags) -
+default 0; use it on the robot only as a logged experiment (the metadata records it) after the joint log shows where the arm sags.
+
+**Weak tracking (opt-in, `run_perception.py ... --track-weak`).** A stickered ball seen with only 1-2 stickers (centre 1-2 cm off) still
+helps the shot detector start and follow the ball - bridging frames the camera coverage loses (the lab: 17-29 % of frames without a
+3-sticker sample over the far half) - but is never sent as a ball sample: the estimator sees 3+ stickers only; a shot still needs 2
+good samples to start and "turned" looks at good samples only. Status line: `ball followed through 1-2 stickers N frames`. In
+simulation with the lab's noise and far-half losses (`--sensing lab --far-drop 0.12`, 64 balls each): lost shots 4 -> 1, late plans
+25 -> 21, returns 96.9 vs 95.3 % (1 ball, not significant). Try it on the robot and compare the logs' start x and lost shots.
+
 **Ball noise (2026-11-02).** The lab's stickered ball scatters ~6 mm per axis after the sphere fit (first shot log), not ~1.4 mm as
 simulated; with the estimator told 1 mm it reads the scatter as spin and its first plans miss by 23-31 cm. `g1_pingpong_real` now tells
 it 7 mm (`PingPongPolicyCfg(noise=0.007)`; `--ball-noise-mm` overrides): in simulation with the lab's noise (`--sensing lab`: 120 Hz,
@@ -189,6 +213,64 @@ logged 6.6-8.3 ms apart, some 0.6 ms). Both receivers (perception from the relay
 times - Motive's frame times, perception's capture times - plus the median offset to their clock (`pingpong/deploy/mocap.py` ClockMap):
 the frames are back on the exact grid, the mean latency is unchanged. Perception's status and the player's 5 s line show `arrival jitter
 removed p95 x ms` (how much was taken out). A relay without Motive's timestamps falls back to arrival minus age.
+
+**Planner timing (2026-11-02).** On the robot the first plan's job took 36 ms median, 80 ms p95 (session 1751; re-plans 7 / 37 ms), each
+20 ms one step of preparation lost. The jobs already run on a worker thread (the 50 Hz loop never waits for them, `n_busy` 0), so the
+question is whether the CPU is slow or the thread waits for Python's interpreter lock. On the robot, player stopped, pingpong folder:
+```bash
+python scripts/deploy/planner_timing.py <RoboJuDo>/logs/pingpong/shots_1751.json     # robojudo env, PINGPONG_ROOT set; ~3 min
+python scripts/deploy/planner_timing.py <RoboJuDo>/logs/pingpong/shots_1751.json --modes thread,process --extra-thread 500 0.2   # if inconclusive
+```
+It replays the log's balls through the player's runtime and times the jobs `alone` (nothing else running), as `thread` (as deployed, with
+the 50 Hz loop and a receiver thread) and as a separate `process`, beside the live times. alone ~ live: the CPU is slow (the planner
+must do less); thread ~ live >> alone: the lock (a planner process helps if `process` ~ `alone`); both << live: something the replay
+does not run (the SDK / ROS threads: `--extra-thread`). On an x86 desktop (6 shots): first plan 13 ms alone, 18 thread, 22 process; with
+a 500 Hz x 0.5 ms Python thread added, thread mode stalled once (re-plan 69 ms, the loop 50 ms late), process mode not at all.
+
+**B10. Testing the planner and the policy apart (2026-11-02).** They meet only at the 12 command numbers of the swing clock.
+*The planner alone* (offline, any computer with torch): would the ball have gone back with a perfect racket?
+```bash
+python scripts/deploy/planner_check.py shots_1751.json --checkpoint <run>/model_N.pt --shots     # pingpong folder
+```
+It fits the real ball in hindsight (all its samples, bounce and spin), puts an exact racket where and when each plan said, and flies
+the ball with the sim's contact physics. Session 1751: of the 20 balls seen after their bounce with a sound fit, the LAST plan returns
+18 (90 %; 16/17 when the ball was seen up to the strike, ball error 15 mm), the FIRST plan 3 (ball error 139 mm: the early plans
+are far off, the re-plans fix them). 10 balls were lost at or before the bounce, 7 tracks were not one ball's flight (perception).
+*The policy alone* - shadow swings, no ball: the player replays a log's plans to the swing clock at the times they were applied live
+(`pingpong/deploy/script_plans.py`), ignoring balls; perception runs as usual for the pelvis. The recorder then gives the racket
+against the same targets:
+```bash
+python scripts/run_pingpong.py -c g1_pingpong_real --script-plans shots_1751.json --log      # robot (the shot log by name from logs/pingpong/)
+python scripts/run_pingpong.py -c g1_pingpong_inproc --script-plans shots_1751.json --log    # sim reference
+python scripts/deploy/analyze_shots.py <RoboJuDo>/logs/pingpong/shadow_<date>_<time>.json        # pingpong folder: its racket rows
+```
+The first scripted swing starts 3 s after the policy runs, each next one 1 s after the last swing is over (37 shots ~1.5 min); the
+robot steps where the plans say. On the robot it keeps standing when done (Ctrl-C writes the log); in simulation it serves no ball and
+ends. Same plans (1751): simulation racket 40 mm from its target (median; p90 172), normal 5.6 deg, +47 ms after the commanded strike;
+live on the robot 101 mm (flips corrected), normal 18 deg, z -58 mm. The robot's shadow run separates the policy + robot from
+perception's pelvis pose and the ball. A paddle rigid body in Motive (3-4 markers on the blade back) would check the joints' FK.
+
+*The policy alone, live: you are the planner* (2026-11-03). The player takes swings typed in a console instead of the planner's
+(`pingpong/deploy/manual_plans.py`; balls ignored, perception runs for the pelvis):
+```bash
+python scripts/run_pingpong.py -c g1_pingpong_real --manual --log    # terminal 1 -> logs/pingpong/manual_<date>_<time>.json
+# simulation: -c g1_pingpong_inproc --manual --window --log   (--window opens the MuJoCo viewer; --manual paces it to real time)
+python scripts/deploy/planner_console.py                                                          # terminal 2, pingpong folder
+```
+A bare swing name (`fh_t100`, `bh_t125`, `bh_flick_t100`, ...; `list` shows them) is that swing's DEFAULT target: the typical row
+of the planner table the run trained on (not the clip's own strike: the planner's face normal comes from the ball's physics and
+differs from the clip's by 35-105 deg). Nudge it: `fh_t100 dz=-3cm dy=2cm`, `in=1.2` (s to the strike), `step=0.2,0` (forward,
+left; the target moves with it), `speed=1.2`, `up=10` / `yaw=-5` (face normal, deg), `random [swing]` (a random training row),
+`replan dz=2cm` (during the swing), `again`, `status`, `help`. Refused, with the reason: y/z beyond the planner's reach box (y +-25,
+z -30..+10 cm from the swing's strike), a step beyond the run's footwork, a strike sooner than the swing's lead, a second swing while
+one is on, a swing the run never trained with targets (`bh_banana_t100`). Allowed with a WARNING: x, normal or speed outside the
+training rows. After each swing the console gets its result: the paddle face's closest approach to the target and when (as
+`analyze_shots.py`), the normal's error, the pelvis against the station. The player listens on 127.0.0.1:7790; a console on another
+computer: `--manual-host 0.0.0.0` on the player, `--host <robot>` on the console.
+Simulation (inproc, 2026-11-03), defaults: fh_t100 3-13 mm, bh_t100 8, fh_t125 19, flick_t100 17, push 52, fh_high 13 mm at
++33..+50 ms, normal 3-11 deg; nudged fh_t100 dz -5 / +5 / dy -8 cm: 1 / 19 / 22 mm; step 0.3 m: 10 mm; up 10 deg: 6 mm, 3.4 deg;
+a re-plan dz -4 cm mid-swing: 4 mm. FIRST FINDING: `random bh_flick_t125` row 600 (racket 2.3 m/s mostly sideways) makes the
+policy present the OTHER face (normal 160 deg off, reproducible); the default and 5 other rows 9-15 deg.
 
 ## Watchdogs and stops
 

@@ -29,6 +29,7 @@ class G1PingPongMujocoEnvCfg(G1MujocoEnvCfg):
     sim_decimation: int = 40  # -> 50 Hz control
     headless: bool = True  # no viewer window
     solid_table: bool = True  # the table top, legs, net and posts collide with the robot
+    paddle_extra_mass: float = 0.0  # kg added at the blade centre: the real paddle + connector are heavier than the model (sag test)
 
 
 class G1PingPongUnitreeCfg(G1UnitreeCfg):
